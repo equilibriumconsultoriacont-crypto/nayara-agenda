@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build": "npx vite build",
     "preview": "vite preview",
     "server": "node server.js",
     "start": "node server.js"
@@ -18,9 +18,11 @@
     "node-cron": "^3.0.3",
     "nodemailer": "^6.9.9",
     "pg": "^8.11.3",
-    "react": "^19.2.8",
-    "react-dom": "^19.2.8",
-    "web-push": "^3.6.7"
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "web-push": "^3.6.7",
+    "vite": "^5.0.12",
+    "@vitejs/plugin-react": "^4.2.1"
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",
@@ -28,8 +30,6 @@
     "@types/express": "^4.17.21",
     "@types/node": "^20.11.5",
     "@types/web-push": "^3.6.3",
-    "@vitejs/plugin-react": "^4.2.1",
-    "typescript": "^5.3.3",
-    "vite": "^5.0.12"
+    "typescript": "^5.3.3"
   }
 }
