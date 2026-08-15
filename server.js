@@ -101,6 +101,9 @@ async function setupDB() {
     )
   `);
 
+  // Migração aditiva: responsável por um lembrete num dia (viewer marcado).
+  await query(`ALTER TABLE shift_tags ADD COLUMN IF NOT EXISTS assigned_user_id INTEGER`);
+
   // Admin padrão
   const existing = await query("SELECT id FROM users WHERE email = $1", ["nayara.hummel@icloud.com"]);
   if (existing.rows.length === 0) {
@@ -117,20 +120,24 @@ const VAPID_PUBLIC = process.env.VAPID_PUBLIC_KEY || "BEl62iUYgUivxIkv69yViEuiBI
 const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || "UUxI4O8-HoUAitoVgEHe9UmklZ7kFSLBIBEd7iEFEqI";
 webpush.setVapidDetails("mailto:nayara.hummel@icloud.com", VAPID_PUBLIC, VAPID_PRIVATE);
 
-async function sendPushToAll(ownerId, title, body) {
-  const viewers = await query("SELECT id FROM users WHERE owner_id=$1", [ownerId]);
-  const allIds = [ownerId, ...viewers.rows.map(u => u.id)];
-  for (const userId of allIds) {
-    const subR = await query("SELECT subscription FROM push_subscriptions WHERE user_id=$1", [userId]);
-    if (!subR.rows[0]) continue;
-    try {
-      await webpush.sendNotification(
-        JSON.parse(subR.rows[0].subscription),
-        JSON.stringify({ title, body, icon: "/icon.svg", badge: "/icon.svg" })
-      );
-    } catch (e) {
-      if (e.statusCode === 410) await query("DELETE FROM push_subscriptions WHERE user_id=$1", [userId]);
+// Envia um push para UM usuário específico. Retorna true se havia inscrição e o envio saiu.
+async function sendPushToUser(userId, title, body) {
+  const subR = await query("SELECT subscription FROM push_subscriptions WHERE user_id=$1", [userId]);
+  if (!subR.rows[0]) return false;
+  try {
+    await webpush.sendNotification(
+      JSON.parse(subR.rows[0].subscription),
+      JSON.stringify({ title, body, icon: "/icon-192.png", badge: "/icon-192.png" })
+    );
+    return true;
+  } catch (e) {
+    // 410/404 = inscrição expirada/removida no navegador → limpa
+    if (e.statusCode === 410 || e.statusCode === 404) {
+      await query("DELETE FROM push_subscriptions WHERE user_id=$1", [userId]);
+    } else {
+      console.warn("[push] erro ao enviar p/ user", userId, e?.statusCode, e?.message);
     }
+    return false;
   }
 }
 
@@ -154,35 +161,37 @@ async function sendNotificationsForDate(dateStr) {
   const owners = await query("SELECT id, name FROM users WHERE role='owner'");
   for (const owner of owners.rows) {
     const { body, shift } = await buildShiftMessage(owner.id, dateStr);
-    const settings = await query("SELECT * FROM notification_settings WHERE user_id=$1", [owner.id]);
-    const s = settings.rows[0] || { notify_midnight: true, notify_tags: true };
 
-    let fullBody = body;
-    if (s.notify_tags && shift) {
-      const tagsR = await query(`
-        SELECT t.name, t.emoji, st.start_time FROM shift_tags st
-        JOIN tags t ON t.id = st.tag_id WHERE st.owner_id=$1 AND st.date=$2
-      `, [owner.id, dateStr]);
-      if (tagsR.rows.length > 0) {
-        fullBody += "\n" + tagsR.rows.map(t => `${t.emoji} ${t.name}${t.start_time ? ` às ${t.start_time}` : ""}`).join(" · ");
-      }
-    }
+    // Lembretes (tags) do dia — buscados SEMPRE, mesmo sem turno registrado.
+    const tagsR = await query(`
+      SELECT t.name, t.emoji, st.start_time FROM shift_tags st
+      JOIN tags t ON t.id = st.tag_id WHERE st.owner_id=$1 AND st.date=$2
+      ORDER BY st.start_time NULLS LAST
+    `, [owner.id, dateStr]);
+    const hasTags = tagsR.rows.length > 0;
+    const tagsLine = hasTags
+      ? tagsR.rows.map(t => `${t.emoji} ${t.name}${t.start_time ? ` às ${t.start_time}` : ""}`).join(" · ")
+      : "";
+
+    // Dia totalmente vazio (sem turno e sem lembrete) → não notifica (evita "nenhum turno" todo dia).
+    if (!shift && !hasTags) continue;
 
     const title = `📅 Agenda — ${new Date(dateStr + "T12:00:00").toLocaleDateString("pt-BR", { weekday: "short", day: "2-digit", month: "2-digit" })}`;
 
-    // Busca todos os usuários que devem receber (owner + viewers com configuração ativa)
+    // Owner + viewers, cada um respeitando as próprias preferências.
+    const ownerSettings = await query("SELECT notify_tags FROM notification_settings WHERE user_id=$1", [owner.id]);
     const viewers = await query("SELECT u.id, ns.notify_midnight, ns.notify_tags FROM users u LEFT JOIN notification_settings ns ON ns.user_id = u.id WHERE u.owner_id=$1", [owner.id]);
-    const allUsers = [{ id: owner.id, notify: true }, ...viewers.rows.map(v => ({ id: v.id, notify: v.notify_midnight !== false }))];
+    const recipients = [
+      { id: owner.id, notify: true, notifyTags: ownerSettings.rows[0]?.notify_tags !== false },
+      ...viewers.rows.map(v => ({ id: v.id, notify: v.notify_midnight !== false, notifyTags: v.notify_tags !== false })),
+    ];
 
-    for (const u of allUsers) {
+    for (const u of recipients) {
       if (!u.notify) continue;
-      const subR = await query("SELECT subscription FROM push_subscriptions WHERE user_id=$1", [u.id]);
-      if (!subR.rows[0]) continue;
-      try {
-        await webpush.sendNotification(JSON.parse(subR.rows[0].subscription), JSON.stringify({ title, body: fullBody, icon: "/icon.svg" }));
-      } catch (e) {
-        if (e.statusCode === 410) await query("DELETE FROM push_subscriptions WHERE user_id=$1", [u.id]);
-      }
+      let fullBody = shift ? body : "";
+      if (u.notifyTags && tagsLine) fullBody += (fullBody ? "\n" : "") + tagsLine;
+      if (!fullBody) fullBody = body; // fallback (ex.: só lembrete mas viewer com tags off)
+      await sendPushToUser(u.id, title, fullBody);
     }
   }
 }
@@ -221,12 +230,43 @@ cron.schedule("0 * * * *", async () => {
   }
 });
 
+// ── Cron: a cada minuto — lembrete de tag com responsável, 2h antes do horário ─
+cron.schedule("* * * * *", async () => {
+  const nowB = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Sao_Paulo" }));
+  const target = new Date(nowB.getTime() + 2 * 60 * 60 * 1000); // agora + 2h
+  const hh = String(target.getHours()).padStart(2, "0");
+  const mm = String(target.getMinutes()).padStart(2, "0");
+  const todayStr = `${nowB.getFullYear()}-${String(nowB.getMonth() + 1).padStart(2, "0")}-${String(nowB.getDate()).padStart(2, "0")}`;
+  try {
+    const rows = await query(`
+      SELECT st.assigned_user_id, st.start_time, t.name, t.emoji
+      FROM shift_tags st JOIN tags t ON t.id = st.tag_id
+      WHERE st.date=$1 AND st.assigned_user_id IS NOT NULL AND st.start_time=$2
+    `, [todayStr, `${hh}:${mm}`]);
+    for (const r of rows.rows) {
+      await sendPushToUser(r.assigned_user_id, "⏰ Faltam 2 horas", `${r.emoji || "🏷️"} ${r.name} às ${r.start_time}`);
+    }
+  } catch (e) { console.warn("[cron 2h tag]", e?.message); }
+}, { timezone: "America/Sao_Paulo" });
+
 // ── Auth ──────────────────────────────────────────────────────────────────────
-async function signToken(userId) {
-  return new SignJWT({ sub: String(userId) })
-    .setProtectedHeader({ alg: "HS256" })
-    .setExpirationTime("30d")
-    .sign(SECRET);
+// Segundos até a próxima meia-noite no horário de Brasília.
+function secondsUntilBrasiliaMidnight() {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Sao_Paulo", hourCycle: "h23",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+  }).formatToParts(new Date());
+  const get = (t) => Number(parts.find((p) => p.type === t).value);
+  const secs = 24 * 3600 - (get("hour") * 3600 + get("minute") * 60 + get("second"));
+  return secs <= 0 ? 24 * 3600 : secs;
+}
+
+// remember=true → 30 dias; senão → expira na próxima meia-noite (derruba todo dia).
+async function signToken(userId, remember) {
+  const jwt = new SignJWT({ sub: String(userId) }).setProtectedHeader({ alg: "HS256" });
+  if (remember) jwt.setExpirationTime("30d");
+  else jwt.setExpirationTime(Math.floor(Date.now() / 1000) + secondsUntilBrasiliaMidnight());
+  return jwt.sign(SECRET);
 }
 async function verifyToken(token) {
   try { const { payload } = await jwtVerify(token, SECRET); return Number(payload.sub); }
@@ -255,16 +295,16 @@ app.get("/health", (_, res) => res.json({ ok: true, time: new Date().toISOString
 
 // Auth
 app.post("/api/login", async (req, res) => {
-  const { email, password } = req.body;
+  const { email, password, remember } = req.body;
   if (!email || !password) return res.status(400).json({ error: "E-mail e senha obrigatórios" });
   const r = await query("SELECT * FROM users WHERE email=$1", [email.trim().toLowerCase()]);
   const user = r.rows[0];
   if (!user || !bcrypt.compareSync(password, user.password_hash))
     return res.status(401).json({ error: "Credenciais inválidas" });
-  const token = await signToken(user.id);
+  const token = await signToken(user.id, !!remember);
   res.cookie(COOKIE, token, {
-    httpOnly: true, secure: process.env.NODE_ENV === "production",
-    sameSite: "lax", maxAge: 30 * 24 * 60 * 60 * 1000,
+    httpOnly: true, secure: process.env.NODE_ENV === "production", sameSite: "lax",
+    maxAge: (remember ? 30 * 24 * 60 * 60 : secondsUntilBrasiliaMidnight()) * 1000,
   });
   res.json({ success: true, user: { id: user.id, name: user.name, email: user.email, role: user.role, ownerId: user.owner_id } });
 });
@@ -308,8 +348,10 @@ app.get("/api/shifts/:year/:month", requireAuth, async (req, res) => {
   const [shiftsR, tagsR] = await Promise.all([
     query("SELECT * FROM shifts WHERE owner_id=$1 AND date LIKE $2", [ownerId, `${prefix}%`]),
     query(`
-      SELECT st.*, t.name as tag_name, t.color as tag_color, t.emoji as tag_emoji
+      SELECT st.*, t.name as tag_name, t.color as tag_color, t.emoji as tag_emoji,
+             au.name as assignee_name
       FROM shift_tags st JOIN tags t ON t.id=st.tag_id
+      LEFT JOIN users au ON au.id=st.assigned_user_id
       WHERE st.owner_id=$1 AND st.date LIKE $2
     `, [ownerId, `${prefix}%`]),
   ]);
@@ -328,8 +370,10 @@ app.get("/api/shifts/:date/detail", requireAuth, async (req, res) => {
   const [shiftR, tagsR] = await Promise.all([
     query("SELECT * FROM shifts WHERE owner_id=$1 AND date=$2", [ownerId, date]),
     query(`
-      SELECT st.*, t.name as tag_name, t.color as tag_color, t.emoji as tag_emoji
+      SELECT st.*, t.name as tag_name, t.color as tag_color, t.emoji as tag_emoji,
+             au.name as assignee_name
       FROM shift_tags st JOIN tags t ON t.id=st.tag_id
+      LEFT JOIN users au ON au.id=st.assigned_user_id
       WHERE st.owner_id=$1 AND st.date=$2
       ORDER BY st.start_time
     `, [ownerId, date]),
@@ -384,13 +428,37 @@ app.delete("/api/tags/:id", requireAuth, async (req, res) => {
 app.put("/api/shift-tags/:date/:tagId", requireAuth, async (req, res) => {
   if (req.user.role !== "owner") return res.status(403).json({ error: "Sem permissão" });
   const { date, tagId } = req.params;
-  const { startTime, endTime, notes } = req.body;
+  const { startTime, endTime, notes, assignedUserId } = req.body;
+
+  // Valida o responsável: precisa ser alguém que ESTA owner liberou (viewer dela).
+  let assigned = null;
+  if (assignedUserId) {
+    const v = await query("SELECT id, name FROM users WHERE id=$1 AND owner_id=$2", [Number(assignedUserId), req.user.id]);
+    if (v.rows[0]) assigned = v.rows[0];
+  }
+
+  // Guarda o responsável anterior p/ só notificar quando muda (evita spam ao reeditar horário).
+  const prev = await query("SELECT assigned_user_id FROM shift_tags WHERE owner_id=$1 AND date=$2 AND tag_id=$3",
+    [req.user.id, date, Number(tagId)]);
+
   await query(`
-    INSERT INTO shift_tags (owner_id,date,tag_id,start_time,end_time,notes)
-    VALUES ($1,$2,$3,$4,$5,$6)
+    INSERT INTO shift_tags (owner_id,date,tag_id,start_time,end_time,notes,assigned_user_id)
+    VALUES ($1,$2,$3,$4,$5,$6,$7)
     ON CONFLICT (owner_id,date,tag_id) DO UPDATE SET
-      start_time=$4,end_time=$5,notes=$6
-  `, [req.user.id, date, Number(tagId), startTime||null, endTime||null, notes||null]);
+      start_time=$4,end_time=$5,notes=$6,assigned_user_id=$7
+  `, [req.user.id, date, Number(tagId), startTime||null, endTime||null, notes||null, assigned?.id || null]);
+
+  // Notificação IMEDIATA para o responsável recém-marcado.
+  if (assigned && prev.rows[0]?.assigned_user_id !== assigned.id) {
+    const tagR = await query("SELECT name, emoji FROM tags WHERE id=$1", [Number(tagId)]);
+    const t = tagR.rows[0] || {};
+    const dLabel = new Date(date + "T12:00:00").toLocaleDateString("pt-BR", { weekday: "long", day: "2-digit", month: "2-digit" });
+    await sendPushToUser(
+      assigned.id,
+      `🏷️ ${req.user.name} marcou você`,
+      `${t.emoji || "🏷️"} ${t.name}${startTime ? ` às ${startTime}` : ""} — ${dLabel}`
+    );
+  }
   res.json({ success: true });
 });
 app.delete("/api/shift-tags/:date/:tagId", requireAuth, async (req, res) => {
@@ -410,6 +478,28 @@ app.post("/api/push/subscribe", requireAuth, async (req, res) => {
   res.json({ success: true });
 });
 app.get("/api/push/vapid-key", (_, res) => res.json({ publicKey: VAPID_PUBLIC }));
+
+// Dispara uma notificação de teste imediata para o próprio usuário logado.
+app.post("/api/push/test", requireAuth, async (req, res) => {
+  const ok = await sendPushToUser(
+    req.user.id,
+    "🔔 Teste — Agenda Nayara",
+    "Deu certo! As notificações estão funcionando 🎉"
+  );
+  if (!ok) return res.status(400).json({
+    error: "Nenhuma inscrição de notificação encontrada. Toque em 'Ativar notificações' e, no iPhone, adicione o app à Tela de Início antes."
+  });
+  res.json({ success: true });
+});
+
+// Owner: envia agora o resumo de hoje para todos (owner + quem ela liberou). Útil para testar.
+app.post("/api/push/send-today", requireAuth, async (req, res) => {
+  if (req.user.role !== "owner") return res.status(403).json({ error: "Sem permissão" });
+  const todayStr = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Sao_Paulo" }))
+    .toISOString().slice(0, 10);
+  await sendNotificationsForDate(todayStr);
+  res.json({ success: true });
+});
 
 // Notification settings — do próprio usuário logado
 app.get("/api/notification-settings", requireAuth, async (req, res) => {

@@ -3,8 +3,8 @@ self.addEventListener('push', function(event) {
   event.waitUntil(
     self.registration.showNotification(data.title || 'Agenda Nayara', {
       body: data.body || '',
-      icon: '/icon.svg',
-      badge: '/icon.svg',
+      icon: data.icon || '/icon-192.png',
+      badge: data.badge || '/icon-192.png',
       vibrate: [200, 100, 200],
     })
   );

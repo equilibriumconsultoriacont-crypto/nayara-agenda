@@ -12,6 +12,7 @@ export default function DayDetail({ date, user, onClose, onEdit, onRefresh }) {
   const [shift, setShift] = useState(null);
   const [tags, setTags] = useState([]);
   const [allTags, setAllTags] = useState([]);
+  const [viewers, setViewers] = useState([]);
   const [loading, setLoading] = useState(true);
 
   const [y, m, d] = date.split('-');
@@ -28,14 +29,38 @@ export default function DayDetail({ date, user, onClose, onEdit, onRefresh }) {
       setShift(data.shift || null);
       setTags(data.tags || []);
     } catch {}
-    // Load all tags for owner to toggle
+    // Owner: carrega todas as tags (para adicionar) e a lista de pessoas liberadas (responsáveis).
     if (user.role === 'owner') {
       try {
         const r2 = await fetch('/api/tags');
         if (r2.ok) setAllTags(await r2.json());
+        const r3 = await fetch('/api/users');
+        if (r3.ok) setViewers(await r3.json());
       } catch {}
     }
     setLoading(false);
+  }
+
+  // Atualiza horário / responsável de um lembrete já preso no dia.
+  async function updateShiftTag(tagId, patch) {
+    const cur = tags.find(t => t.tag_id === tagId) || {};
+    await fetch(`/api/shift-tags/${date}/${tagId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        startTime: patch.startTime !== undefined ? patch.startTime : (cur.start_time || null),
+        assignedUserId: patch.assignedUserId !== undefined ? patch.assignedUserId : (cur.assigned_user_id || null),
+      }),
+    });
+    await load();
+    onRefresh();
+  }
+
+  async function handleDeleteShift() {
+    if (!confirm('Apagar o turno deste dia? Isso não remove os lembretes.')) return;
+    await fetch(`/api/shifts/${date}`, { method: 'DELETE' });
+    onRefresh();
+    onClose();
   }
 
   async function toggleTag(tag) {
@@ -137,26 +162,53 @@ export default function DayDetail({ date, user, onClose, onEdit, onRefresh }) {
                 <div style={{display:'flex',flexDirection:'column',gap:8}}>
                   {tags.map(t => (
                     <div key={t.tag_id} style={{
-                      display:'flex',alignItems:'center',gap:10,
                       padding:'10px 14px',borderRadius:12,
                       background:'rgba(109,40,217,0.1)',
                       border:`1px solid ${t.tag_color || '#6d28d9'}44`,
                     }}>
-                      <span style={{fontSize:22}}>{t.tag_emoji || '🏷️'}</span>
-                      <div style={{flex:1}}>
-                        <p style={{fontWeight:600,color:'#e2e8f0',fontSize:14}}>{t.tag_name}</p>
-                        {t.start_time && (
-                          <p style={{fontSize:12,color:'#a78bfa',marginTop:2}}>
-                            ⏰ {t.start_time}{t.end_time ? ` → ${t.end_time}` : ''}
-                          </p>
+                      <div style={{display:'flex',alignItems:'center',gap:10}}>
+                        <span style={{fontSize:22}}>{t.tag_emoji || '🏷️'}</span>
+                        <div style={{flex:1,minWidth:0}}>
+                          <p style={{fontWeight:600,color:'#e2e8f0',fontSize:14}}>{t.tag_name}</p>
+                          {t.start_time && (
+                            <p style={{fontSize:12,color:'#a78bfa',marginTop:2}}>
+                              ⏰ {t.start_time}{t.end_time ? ` → ${t.end_time}` : ''}
+                            </p>
+                          )}
+                          {t.assignee_name && (
+                            <p style={{fontSize:12,color:'#6ee7b7',marginTop:2}}>👤 Responsável: {t.assignee_name}</p>
+                          )}
+                          {t.notes && <p style={{fontSize:12,color:'#94a3b8'}}>{t.notes}</p>}
+                        </div>
+                        {user.role === 'owner' && (
+                          <button onClick={() => toggleTag({ id: t.tag_id })} style={{
+                            background:'rgba(239,68,68,0.15)',border:'none',
+                            color:'#f87171',borderRadius:8,padding:'4px 8px',fontSize:14,
+                          }}>✕</button>
                         )}
-                        {t.notes && <p style={{fontSize:12,color:'#94a3b8'}}>{t.notes}</p>}
                       </div>
+
+                      {/* Owner: define horário e responsável do lembrete */}
                       {user.role === 'owner' && (
-                        <button onClick={() => toggleTag({ id: t.tag_id })} style={{
-                          background:'rgba(239,68,68,0.15)',border:'none',
-                          color:'#f87171',borderRadius:8,padding:'4px 8px',fontSize:14,
-                        }}>✕</button>
+                        <div style={{display:'flex',gap:8,marginTop:10}}>
+                          <input type="time" value={t.start_time || ''}
+                            onChange={e => updateShiftTag(t.tag_id, { startTime: e.target.value || null })}
+                            style={{
+                              width:110,padding:'8px',borderRadius:8,fontSize:13,
+                              background:'rgba(109,40,217,0.15)',border:'1px solid rgba(109,40,217,0.3)',
+                              color:'#e2e8f0',outline:'none',
+                            }}/>
+                          <select value={t.assigned_user_id || ''}
+                            onChange={e => updateShiftTag(t.tag_id, { assignedUserId: e.target.value ? Number(e.target.value) : null })}
+                            style={{
+                              flex:1,padding:'8px',borderRadius:8,fontSize:13,
+                              background:'rgba(109,40,217,0.15)',border:'1px solid rgba(109,40,217,0.3)',
+                              color:'#e2e8f0',outline:'none',
+                            }}>
+                            <option value="">Sem responsável</option>
+                            {viewers.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+                          </select>
+                        </div>
                       )}
                     </div>
                   ))}
@@ -183,13 +235,20 @@ export default function DayDetail({ date, user, onClose, onEdit, onRefresh }) {
               </div>
             )}
 
-            {/* Owner: edit button */}
+            {/* Owner: edit + delete buttons */}
             {user.role === 'owner' && shift && (
-              <button onClick={onEdit} style={{
-                width:'100%',padding:'13px',borderRadius:12,border:'none',
-                background:'linear-gradient(135deg,#6d28d9,#a855f7)',
-                color:'#fff',fontSize:15,fontWeight:700,marginBottom:8,
-              }}>✏️ Editar turno</button>
+              <div style={{display:'flex',gap:8,marginBottom:8}}>
+                <button onClick={onEdit} style={{
+                  flex:1,padding:'13px',borderRadius:12,border:'none',
+                  background:'linear-gradient(135deg,#6d28d9,#a855f7)',
+                  color:'#fff',fontSize:15,fontWeight:700,
+                }}>✏️ Editar</button>
+                <button onClick={handleDeleteShift} style={{
+                  padding:'13px 18px',borderRadius:12,
+                  border:'1px solid rgba(239,68,68,0.4)',background:'rgba(239,68,68,0.12)',
+                  color:'#f87171',fontSize:15,fontWeight:700,
+                }}>🗑️ Apagar</button>
+              </div>
             )}
           </>
         )}

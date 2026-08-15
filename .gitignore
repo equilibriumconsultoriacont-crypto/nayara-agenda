@@ -2,3 +2,4 @@ node_modules/
 dist/
 agenda.db
 .env
+CHAVES_VAPID.local.txt

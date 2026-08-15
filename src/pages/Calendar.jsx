@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import ShiftModal from '../components/ShiftModal.jsx';
 import DayDetail from '../components/DayDetail.jsx';
+import { enablePush } from '../push.js';
 
 const MONTHS = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho',
   'Julho','Agosto','Setembro','Outubro','Novembro','Dezembro'];
@@ -11,13 +12,6 @@ const TYPE_CONFIG = {
   plantao: { emoji: '🏥', label: 'Plantão',   bg: 'rgba(16,185,129,0.2)',  border: 'rgba(16,185,129,0.5)', color: '#6ee7b7' },
   off:     { emoji: '🌙', label: 'Folga',     bg: 'rgba(251,191,36,0.15)', border: 'rgba(251,191,36,0.4)', color: '#fde68a' },
 };
-
-function urlBase64ToUint8Array(base64String) {
-  const padding = '='.repeat((4 - base64String.length % 4) % 4);
-  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
-  const rawData = window.atob(base64);
-  return new Uint8Array([...rawData].map(c => c.charCodeAt(0)));
-}
 
 export default function Calendar({ user }) {
   const now = new Date();
@@ -43,29 +37,9 @@ export default function Calendar({ user }) {
   useEffect(() => { loadShifts(); }, [loadShifts]);
 
   useEffect(() => {
-    setupPush();
+    // Tenta ativar push silenciosamente (se já tiver permissão concedida).
+    if ('Notification' in window && Notification.permission === 'granted') enablePush();
   }, []);
-
-  async function setupPush() {
-    if (!('Notification' in window) || !('serviceWorker' in navigator)) return;
-    let perm = Notification.permission;
-    if (perm === 'default') perm = await Notification.requestPermission();
-    if (perm !== 'granted') return;
-    try {
-      const r = await fetch('/api/push/vapid-key');
-      const { publicKey } = await r.json();
-      const sw = await navigator.serviceWorker.ready;
-      const sub = await sw.pushManager.subscribe({
-        userVisibleOnly: true,
-        applicationServerKey: urlBase64ToUint8Array(publicKey),
-      });
-      await fetch('/api/push/subscribe', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(sub),
-      });
-    } catch {}
-  }
 
   const prevMonth = () => { if (month===1){setMonth(12);setYear(y=>y-1);}else setMonth(m=>m-1); };
   const nextMonth = () => { if (month===12){setMonth(1);setYear(y=>y+1);}else setMonth(m=>m+1); };
@@ -139,7 +113,7 @@ export default function Calendar({ user }) {
             return (
               <div key={idx} onClick={()=>handleDayClick(day)}
                 style={{
-                  borderRadius:10,padding:'5px 3px',minHeight:62,
+                  borderRadius:10,padding:'5px 3px',minHeight:70,
                   background:cfg?cfg.bg:isToday?'rgba(109,40,217,0.15)':'rgba(30,16,53,0.5)',
                   border:`1px solid ${cfg?cfg.border:isToday?'rgba(109,40,217,0.5)':'rgba(109,40,217,0.1)'}`,
                   cursor:'pointer',display:'flex',flexDirection:'column',alignItems:'center',gap:1,
@@ -150,9 +124,13 @@ export default function Calendar({ user }) {
                 onTouchEnd={e=>e.currentTarget.style.transform='scale(1)'}
               >
                 <span style={{fontSize:12,fontWeight:isToday?800:500,color:isToday?'#a78bfa':isSun||isSat?'#f87171':cfg?cfg.color:'#94a3b8'}}>{day}</span>
-                {cfg&&<span style={{fontSize:16}}>{cfg.emoji}</span>}
-                {shift?.hours&&<span style={{fontSize:9,color:cfg?.color,fontWeight:600}}>{shift.hours}h</span>}
-                {shift?.start_time&&<span style={{fontSize:8,color:'#94a3b8'}}>{shift.start_time}</span>}
+                {cfg&&<span style={{fontSize:15,lineHeight:1}}>{cfg.emoji}</span>}
+                {shift&&shift.type!=='off'&&shift.start_time&&(
+                  <span style={{fontSize:8.5,color:cfg?.color,fontWeight:700,lineHeight:1.1,textAlign:'center',whiteSpace:'nowrap'}}>
+                    {shift.start_time}{shift.end_time?`–${shift.end_time}`:''}
+                  </span>
+                )}
+                {shift?.hours>0&&<span style={{fontSize:8,color:'#94a3b8',lineHeight:1}}>{shift.hours}h</span>}
                 {dayTags.slice(0,2).map(t=>(
                   <span key={t.tag_id} style={{fontSize:11}}>{t.tag_emoji}</span>
                 ))}

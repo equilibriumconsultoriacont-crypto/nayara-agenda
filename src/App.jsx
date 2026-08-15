@@ -4,6 +4,7 @@ import Calendar from './pages/Calendar.jsx';
 import Users from './pages/Users.jsx';
 import Tags from './pages/Tags.jsx';
 import Settings from './pages/Settings.jsx';
+import SetupBanner from './components/SetupBanner.jsx';
 
 export default function App() {
   const [user, setUser] = useState(null);
@@ -22,9 +23,20 @@ export default function App() {
   };
 
   if (loading) return (
-    <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',flexDirection:'column',gap:12}}>
-      <span style={{fontSize:48}}>📅</span>
-      <p style={{color:'#a78bfa'}}>Carregando...</p>
+    <div style={{
+      minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',
+      background:'linear-gradient(135deg,#1e1035 0%,#2d1b69 50%,#4c1d95 100%)',
+    }}>
+      <div style={{textAlign:'center'}}>
+        <div className="splash-pulse" style={{
+          width:112,height:112,borderRadius:26,margin:'0 auto 20px',
+          background:'linear-gradient(135deg,#6d28d9,#a855f7)',
+          display:'flex',alignItems:'center',justifyContent:'center',
+          fontSize:62,boxShadow:'0 12px 44px rgba(168,85,247,0.55)',
+        }}>📅</div>
+        <p style={{fontSize:21,fontWeight:800,color:'#e2e8f0',letterSpacing:0.3}}>Agenda Nayara</p>
+        <p style={{color:'#c4b5fd',fontSize:13,marginTop:4}}>Carregando...</p>
+      </div>
     </div>
   );
 
@@ -61,6 +73,7 @@ export default function App() {
       </header>
 
       <main style={{flex:1,overflow:'auto',paddingBottom:72}}>
+        <SetupBanner />
         {page==='calendar' && <Calendar user={user}/>}
         {page==='settings' && <Settings user={user}/>}
         {page==='tags' && <Tags user={user}/>}

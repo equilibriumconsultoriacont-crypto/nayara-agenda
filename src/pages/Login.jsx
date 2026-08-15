@@ -4,6 +4,7 @@ export default function Login({ onLogin }) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPw, setShowPw] = useState(false);
+  const [remember, setRemember] = useState(false);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 
@@ -14,7 +15,7 @@ export default function Login({ onLogin }) {
       const r = await fetch('/api/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: email.trim().toLowerCase(), password }),
+        body: JSON.stringify({ email: email.trim().toLowerCase(), password, remember }),
       });
       const data = await r.json();
       if (!r.ok) { setError(data.error || 'Erro ao entrar'); return; }
@@ -79,6 +80,25 @@ export default function Login({ onLogin }) {
                   }}>{showPw ? '🙈' : '👁️'}</button>
               </div>
             </div>
+
+            {/* Manter-me conectado */}
+            <label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer', userSelect: 'none' }}>
+              <span onClick={() => setRemember(v => !v)} style={{
+                width: 44, height: 24, borderRadius: 12, flexShrink: 0, position: 'relative',
+                background: remember ? '#6d28d9' : '#374151', transition: 'background 0.2s',
+              }}>
+                <span style={{
+                  width: 18, height: 18, borderRadius: '50%', background: '#fff',
+                  position: 'absolute', top: 3, left: remember ? 23 : 3, transition: 'left 0.2s',
+                }}/>
+              </span>
+              <span style={{ color: '#c4b5fd', fontSize: 13 }}>
+                Manter-me conectado
+                <span style={{ display: 'block', color: '#7c3aed', fontSize: 11 }}>
+                  Sem isso, o app pede login todo dia
+                </span>
+              </span>
+            </label>
 
             {error && (
               <div style={{

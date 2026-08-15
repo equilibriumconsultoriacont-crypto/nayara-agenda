@@ -11,3 +11,9 @@ input, textarea, select { font-family: inherit; }
 ::-webkit-scrollbar { width: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #6d28d9; border-radius: 2px; }
+
+@keyframes splashPulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.08); opacity: 0.9; }
+}
+.splash-pulse { animation: splashPulse 1.4s ease-in-out infinite; }
