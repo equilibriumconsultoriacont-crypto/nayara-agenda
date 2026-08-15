@@ -116,8 +116,9 @@ async function setupDB() {
 }
 
 // ── Web Push ──────────────────────────────────────────────────────────────────
-const VAPID_PUBLIC = process.env.VAPID_PUBLIC_KEY || "BEl62iUYgUivxIkv69yViEuiBIa-Ib9-SkvMeAtA3LFgDzkrxZJjSgSnfckjZJkbLQQ4X0j7xt1WvkUHU2l26uM";
-const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || "UUxI4O8-HoUAitoVgEHe9UmklZ7kFSLBIBEd7iEFEqI";
+// Par VAPID próprio da Agenda Nayara (fallback). Pode ser sobreposto por env vars no Render.
+const VAPID_PUBLIC = process.env.VAPID_PUBLIC_KEY || "BAmHwEDX2z4sXxHRhDIqgHNhPMiExlb6OgmKiikYfYeUl9uYfJ85hOnZMkTQXxqwwTBkgEPL9ylc5T5stGnzTtA";
+const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || "7DvvdX-i5QOH41TkofiEECK33v1n7KZgxr1tnv000UA";
 webpush.setVapidDetails("mailto:nayara.hummel@icloud.com", VAPID_PUBLIC, VAPID_PRIVATE);
 
 // Envia um push para UM usuário específico. Retorna true se havia inscrição e o envio saiu.
