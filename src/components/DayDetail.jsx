@@ -14,6 +14,7 @@ export default function DayDetail({ date, user, onClose, onEdit, onRefresh }) {
   const [allTags, setAllTags] = useState([]);
   const [viewers, setViewers] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(false);
 
   const [y, m, d] = date.split('-');
   const dayOfWeek = new Date(date + 'T12:00:00').toLocaleDateString('pt-BR', { weekday: 'long' });
@@ -25,10 +26,12 @@ export default function DayDetail({ date, user, onClose, onEdit, onRefresh }) {
     setLoading(true);
     try {
       const r = await fetch(`/api/shifts/${date}/detail`);
+      if (!r.ok) throw new Error('http ' + r.status);
       const data = await r.json();
       setShift(data.shift || null);
       setTags(data.tags || []);
-    } catch {}
+      setLoadError(false);
+    } catch { setLoadError(true); }
     // Owner: carrega todas as tags (para adicionar) e a lista de pessoas liberadas (responsáveis).
     if (user.role === 'owner') {
       try {
@@ -103,6 +106,15 @@ export default function DayDetail({ date, user, onClose, onEdit, onRefresh }) {
 
         {loading ? (
           <p style={{textAlign:'center',color:'#7c3aed',padding:24}}>Carregando...</p>
+        ) : loadError ? (
+          <div style={{textAlign:'center',padding:'24px 0'}}>
+            <p style={{fontSize:40,marginBottom:8}}>⚠️</p>
+            <p style={{color:'#fca5a5',fontSize:14,marginBottom:12}}>Não consegui carregar este dia.</p>
+            <button onClick={load} style={{
+              padding:'10px 24px',borderRadius:10,border:'1px solid rgba(109,40,217,0.4)',
+              background:'rgba(109,40,217,0.15)',color:'#c4b5fd',fontSize:14,fontWeight:600,
+            }}>Tentar de novo</button>
+          </div>
         ) : (
           <>
             {/* Shift card */}

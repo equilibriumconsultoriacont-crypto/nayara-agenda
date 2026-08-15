@@ -343,6 +343,31 @@ app.delete("/api/users/:id", requireAuth, async (req, res) => {
 // Shifts
 function getOwnerId(user) { return user.role === "owner" ? user.id : user.owner_id; }
 
+// IMPORTANTE: esta rota específica precisa vir ANTES de "/api/shifts/:year/:month",
+// senão o Express casa "/api/shifts/2026-08-15/detail" como year=2026-08-15 / month=detail
+// e o detalhe nunca roda (bug que fazia o dia sempre aparecer "sem turno").
+app.get("/api/shifts/:date/detail", requireAuth, async (req, res) => {
+  try {
+    const ownerId = getOwnerId(req.user);
+    const { date } = req.params;
+    const [shiftR, tagsR] = await Promise.all([
+      query("SELECT * FROM shifts WHERE owner_id=$1 AND date=$2", [ownerId, date]),
+      query(`
+        SELECT st.*, t.name as tag_name, t.color as tag_color, t.emoji as tag_emoji,
+               au.name as assignee_name
+        FROM shift_tags st JOIN tags t ON t.id=st.tag_id
+        LEFT JOIN users au ON au.id=st.assigned_user_id
+        WHERE st.owner_id=$1 AND st.date=$2
+        ORDER BY st.start_time
+      `, [ownerId, date]),
+    ]);
+    res.json({ shift: shiftR.rows[0] || null, tags: tagsR.rows });
+  } catch (e) {
+    console.error("[detail]", e?.message);
+    res.status(500).json({ error: "Erro ao carregar o dia" });
+  }
+});
+
 app.get("/api/shifts/:year/:month", requireAuth, async (req, res) => {
   const ownerId = getOwnerId(req.user);
   const prefix = `${req.params.year}-${String(req.params.month).padStart(2,"0")}`;
@@ -363,23 +388,6 @@ app.get("/api/shifts/:year/:month", requireAuth, async (req, res) => {
     tagsByDate[t.date].push(t);
   });
   res.json({ shifts: shiftsR.rows, tagsByDate });
-});
-
-app.get("/api/shifts/:date/detail", requireAuth, async (req, res) => {
-  const ownerId = getOwnerId(req.user);
-  const { date } = req.params;
-  const [shiftR, tagsR] = await Promise.all([
-    query("SELECT * FROM shifts WHERE owner_id=$1 AND date=$2", [ownerId, date]),
-    query(`
-      SELECT st.*, t.name as tag_name, t.color as tag_color, t.emoji as tag_emoji,
-             au.name as assignee_name
-      FROM shift_tags st JOIN tags t ON t.id=st.tag_id
-      LEFT JOIN users au ON au.id=st.assigned_user_id
-      WHERE st.owner_id=$1 AND st.date=$2
-      ORDER BY st.start_time
-    `, [ownerId, date]),
-  ]);
-  res.json({ shift: shiftR.rows[0] || null, tags: tagsR.rows });
 });
 
 app.put("/api/shifts/:date", requireAuth, async (req, res) => {
