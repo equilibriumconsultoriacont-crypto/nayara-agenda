@@ -44,16 +44,13 @@ export default function DayDetail({ date, user, onClose, onEdit, onRefresh }) {
     setLoading(false);
   }
 
-  // Atualiza horário / responsável de um lembrete já preso no dia.
+  // Salva horário / responsável / observação de um lembrete já preso no dia.
+  // patch já vem completo do ShiftTagRow (startTime, notes, assignedUserId).
   async function updateShiftTag(tagId, patch) {
-    const cur = tags.find(t => t.tag_id === tagId) || {};
     await fetch(`/api/shift-tags/${date}/${tagId}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        startTime: patch.startTime !== undefined ? patch.startTime : (cur.start_time || null),
-        assignedUserId: patch.assignedUserId !== undefined ? patch.assignedUserId : (cur.assigned_user_id || null),
-      }),
+      body: JSON.stringify(patch),
     });
     await load();
     onRefresh();
@@ -173,56 +170,14 @@ export default function DayDetail({ date, user, onClose, onEdit, onRefresh }) {
                 <p style={{fontSize:12,color:'#7c3aed',fontWeight:600,marginBottom:8}}>🏷️ LEMBRETES</p>
                 <div style={{display:'flex',flexDirection:'column',gap:8}}>
                   {tags.map(t => (
-                    <div key={t.tag_id} style={{
-                      padding:'10px 14px',borderRadius:12,
-                      background:'rgba(109,40,217,0.1)',
-                      border:`1px solid ${t.tag_color || '#6d28d9'}44`,
-                    }}>
-                      <div style={{display:'flex',alignItems:'center',gap:10}}>
-                        <span style={{fontSize:22}}>{t.tag_emoji || '🏷️'}</span>
-                        <div style={{flex:1,minWidth:0}}>
-                          <p style={{fontWeight:600,color:'#e2e8f0',fontSize:14}}>{t.tag_name}</p>
-                          {t.start_time && (
-                            <p style={{fontSize:12,color:'#a78bfa',marginTop:2}}>
-                              ⏰ {t.start_time}{t.end_time ? ` → ${t.end_time}` : ''}
-                            </p>
-                          )}
-                          {t.assignee_name && (
-                            <p style={{fontSize:12,color:'#6ee7b7',marginTop:2}}>👤 Responsável: {t.assignee_name}</p>
-                          )}
-                          {t.notes && <p style={{fontSize:12,color:'#94a3b8'}}>{t.notes}</p>}
-                        </div>
-                        {user.role === 'owner' && (
-                          <button onClick={() => toggleTag({ id: t.tag_id })} style={{
-                            background:'rgba(239,68,68,0.15)',border:'none',
-                            color:'#f87171',borderRadius:8,padding:'4px 8px',fontSize:14,
-                          }}>✕</button>
-                        )}
-                      </div>
-
-                      {/* Owner: define horário e responsável do lembrete */}
-                      {user.role === 'owner' && (
-                        <div style={{display:'flex',gap:8,marginTop:10}}>
-                          <input type="time" value={t.start_time || ''}
-                            onChange={e => updateShiftTag(t.tag_id, { startTime: e.target.value || null })}
-                            style={{
-                              width:110,padding:'8px',borderRadius:8,fontSize:13,
-                              background:'rgba(109,40,217,0.15)',border:'1px solid rgba(109,40,217,0.3)',
-                              color:'#e2e8f0',outline:'none',
-                            }}/>
-                          <select value={t.assigned_user_id || ''}
-                            onChange={e => updateShiftTag(t.tag_id, { assignedUserId: e.target.value ? Number(e.target.value) : null })}
-                            style={{
-                              flex:1,padding:'8px',borderRadius:8,fontSize:13,
-                              background:'rgba(109,40,217,0.15)',border:'1px solid rgba(109,40,217,0.3)',
-                              color:'#e2e8f0',outline:'none',
-                            }}>
-                            <option value="">Sem responsável</option>
-                            {viewers.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
-                          </select>
-                        </div>
-                      )}
-                    </div>
+                    <ShiftTagRow
+                      key={t.tag_id}
+                      t={t}
+                      isOwner={user.role === 'owner'}
+                      viewers={viewers}
+                      onRemove={() => toggleTag({ id: t.tag_id })}
+                      onSave={(patch) => updateShiftTag(t.tag_id, patch)}
+                    />
                   ))}
                 </div>
               </div>
@@ -271,6 +226,79 @@ export default function DayDetail({ date, user, onClose, onEdit, onRefresh }) {
           color:'#a78bfa',fontSize:15,fontWeight:600,
         }}>Fechar</button>
       </div>
+    </div>
+  );
+}
+
+// ── Linha de um lembrete preso no dia ──────────────────────────────────────────
+// Estado LOCAL (não recarrega enquanto você digita/escolhe o horário) e salva só
+// quando sai do campo (onBlur) ou troca o responsável — evita o campo fechar e
+// "escolher sozinho" um horário no meio da digitação.
+function ShiftTagRow({ t, isOwner, viewers, onRemove, onSave }) {
+  const [start, setStart] = useState(t.start_time || '');
+  const [notes, setNotes] = useState(t.notes || '');
+  const [assigned, setAssigned] = useState(t.assigned_user_id ? String(t.assigned_user_id) : '');
+
+  const persist = (over = {}) => {
+    const s = over.start !== undefined ? over.start : start;
+    const n = over.notes !== undefined ? over.notes : notes;
+    const a = over.assigned !== undefined ? over.assigned : assigned;
+    onSave({ startTime: s || null, notes: n || null, assignedUserId: a ? Number(a) : null });
+  };
+
+  const field = {
+    padding: '8px', borderRadius: 8, fontSize: 13,
+    background: 'rgba(109,40,217,0.15)', border: '1px solid rgba(109,40,217,0.3)',
+    color: '#e2e8f0', outline: 'none',
+  };
+
+  return (
+    <div style={{
+      padding: '10px 14px', borderRadius: 12,
+      background: 'rgba(109,40,217,0.1)', border: `1px solid ${t.tag_color || '#6d28d9'}44`,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <span style={{ fontSize: 22 }}>{t.tag_emoji || '🏷️'}</span>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <p style={{ fontWeight: 600, color: '#e2e8f0', fontSize: 14 }}>{t.tag_name}</p>
+          {/* Convidado (não-owner): só leitura */}
+          {!isOwner && t.start_time && (
+            <p style={{ fontSize: 12, color: '#a78bfa', marginTop: 2 }}>⏰ {t.start_time}</p>
+          )}
+          {!isOwner && t.assignee_name && (
+            <p style={{ fontSize: 12, color: '#6ee7b7', marginTop: 2 }}>👤 Responsável: {t.assignee_name}</p>
+          )}
+          {!isOwner && t.notes && <p style={{ fontSize: 12, color: '#94a3b8', marginTop: 2 }}>{t.notes}</p>}
+        </div>
+        {isOwner && (
+          <button onClick={onRemove} style={{
+            background: 'rgba(239,68,68,0.15)', border: 'none',
+            color: '#f87171', borderRadius: 8, padding: '4px 8px', fontSize: 14,
+          }}>✕</button>
+        )}
+      </div>
+
+      {isOwner && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 10 }}>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <input type="time" value={start}
+              onChange={e => setStart(e.target.value)}
+              onBlur={() => persist()}
+              style={{ ...field, width: 110 }} />
+            <select value={assigned}
+              onChange={e => { setAssigned(e.target.value); persist({ assigned: e.target.value }); }}
+              style={{ ...field, flex: 1 }}>
+              <option value="">Sem responsável</option>
+              {viewers.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+            </select>
+          </div>
+          <input type="text" value={notes}
+            placeholder="Observação (ex.: portão dos fundos)"
+            onChange={e => setNotes(e.target.value)}
+            onBlur={() => persist()}
+            style={{ ...field, width: '100%' }} />
+        </div>
+      )}
     </div>
   );
 }

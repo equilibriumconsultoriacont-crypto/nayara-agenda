@@ -96,12 +96,12 @@ export default function Calendar({ user }) {
 
       {/* Calendar */}
       <div style={{padding:'0 12px'}}>
-        <div style={{display:'grid',gridTemplateColumns:'repeat(7,1fr)',marginBottom:4}}>
+        <div style={{display:'grid',gridTemplateColumns:'repeat(7,minmax(0,1fr))',gap:3,marginBottom:4}}>
           {WEEKDAYS.map(d=>(
             <div key={d} style={{textAlign:'center',fontSize:11,color:'#7c3aed',fontWeight:600,padding:'4px 0'}}>{d}</div>
           ))}
         </div>
-        <div style={{display:'grid',gridTemplateColumns:'repeat(7,1fr)',gap:3}}>
+        <div style={{display:'grid',gridTemplateColumns:'repeat(7,minmax(0,1fr))',gap:3}}>
           {cells.map((day,idx)=>{
             if (!day) return <div key={idx}/>;
             const dateStr=`${year}-${String(month).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
@@ -113,7 +113,7 @@ export default function Calendar({ user }) {
             return (
               <div key={idx} onClick={()=>handleDayClick(day)}
                 style={{
-                  borderRadius:10,padding:'5px 3px',minHeight:70,
+                  borderRadius:10,padding:'5px 2px',minHeight:70,minWidth:0,overflow:'hidden',boxSizing:'border-box',
                   background:cfg?cfg.bg:isToday?'rgba(109,40,217,0.15)':'rgba(30,16,53,0.5)',
                   border:`1px solid ${cfg?cfg.border:isToday?'rgba(109,40,217,0.5)':'rgba(109,40,217,0.1)'}`,
                   cursor:'pointer',display:'flex',flexDirection:'column',alignItems:'center',gap:1,
@@ -126,8 +126,8 @@ export default function Calendar({ user }) {
                 <span style={{fontSize:12,fontWeight:isToday?800:500,color:isToday?'#a78bfa':isSun||isSat?'#f87171':cfg?cfg.color:'#94a3b8'}}>{day}</span>
                 {cfg&&<span style={{fontSize:15,lineHeight:1}}>{cfg.emoji}</span>}
                 {shift&&shift.type!=='off'&&shift.start_time&&(
-                  <span style={{fontSize:8.5,color:cfg?.color,fontWeight:700,lineHeight:1.1,textAlign:'center',whiteSpace:'nowrap'}}>
-                    {shift.start_time}{shift.end_time?`–${shift.end_time}`:''}
+                  <span style={{fontSize:9,color:cfg?.color,fontWeight:700,lineHeight:1.15,textAlign:'center'}}>
+                    {shift.start_time}{shift.end_time&&<><br/>{shift.end_time}</>}
                   </span>
                 )}
                 {shift?.hours>0&&<span style={{fontSize:8,color:'#94a3b8',lineHeight:1}}>{shift.hours}h</span>}
