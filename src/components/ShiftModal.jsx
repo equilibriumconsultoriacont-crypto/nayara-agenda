@@ -5,8 +5,8 @@ const MONTHS_PT = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho',
 
 export default function ShiftModal({ date, shift, onSave, onDelete, onClose }) {
   const [type, setType] = useState(shift?.type || 'work');
-  const [startTime, setStartTime] = useState(shift?.startTime || '07:00');
-  const [endTime, setEndTime] = useState(shift?.endTime || '13:00');
+  const [startTime, setStartTime] = useState(shift?.start_time || '07:00');
+  const [endTime, setEndTime] = useState(shift?.end_time || '13:00');
   const [hours, setHours] = useState(shift?.hours || 6);
   const [notes, setNotes] = useState(shift?.notes || '');
   const [saving, setSaving] = useState(false);

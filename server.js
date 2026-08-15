@@ -195,24 +195,31 @@ cron.schedule("0 0 * * *", async () => {
 }, { timezone: "America/Sao_Paulo" });
 
 // ── Cron: a cada hora — verifica notificações antecipadas ────────────────────
+// Roda a cada hora cheia. Para cada owner, olha o horário local dele (Brasília)
+// e dispara o aviso do dia seguinte quando faltar exatamente X horas para 00:00.
 cron.schedule("0 * * * *", async () => {
-  const now = new Date();
-  const currentHour = now.getHours();
+  // Hora atual em Brasília, independente do timezone do servidor
+  const nowBrasilia = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Sao_Paulo" }));
+  const currentHour = nowBrasilia.getHours();
+
   const owners = await query("SELECT id FROM users WHERE role='owner'");
   for (const owner of owners.rows) {
     const settings = await query("SELECT notify_hours_before FROM notification_settings WHERE user_id=$1", [owner.id]);
     const hoursB = settings.rows[0]?.notify_hours_before || 0;
     if (!hoursB) continue;
-    // Calcula a data alvo: hoje + hoursB horas
-    const target = new Date(now);
-    target.setHours(now.getHours() + hoursB);
-    const targetDate = target.toISOString().slice(0, 10);
-    // Só dispara se currentHour === 0 (início do dia alvo com X horas de antecedência)
-    if (currentHour === (24 - hoursB) % 24) {
-      await sendNotificationsForDate(targetDate);
-    }
+
+    // Se "3 horas antes" está configurado, dispara às 21h (24-3) avisando sobre AMANHÃ
+    const triggerHour = (24 - hoursB) % 24;
+    if (currentHour !== triggerHour) continue;
+
+    const tomorrow = new Date(nowBrasilia);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const y = tomorrow.getFullYear();
+    const m = String(tomorrow.getMonth() + 1).padStart(2, "0");
+    const d = String(tomorrow.getDate()).padStart(2, "0");
+    await sendNotificationsForDate(`${y}-${m}-${d}`);
   }
-}, { timezone: "America/Sao_Paulo" });
+});
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 async function signToken(userId) {
@@ -404,7 +411,7 @@ app.post("/api/push/subscribe", requireAuth, async (req, res) => {
 });
 app.get("/api/push/vapid-key", (_, res) => res.json({ publicKey: VAPID_PUBLIC }));
 
-// Notification settings
+// Notification settings — do próprio usuário logado
 app.get("/api/notification-settings", requireAuth, async (req, res) => {
   const r = await query("SELECT * FROM notification_settings WHERE user_id=$1", [req.user.id]);
   res.json(r.rows[0] || { notify_midnight: true, notify_hours_before: 0, notify_tags: true });
@@ -418,6 +425,31 @@ app.put("/api/notification-settings", requireAuth, async (req, res) => {
     ON CONFLICT (user_id) DO UPDATE SET
       notify_midnight=$2, notify_hours_before=$3, notify_tags=$4
   `, [req.user.id, notify_midnight ?? true, notify_hours_before ?? 0, notify_tags ?? true]);
+  res.json({ success: true });
+});
+
+// Owner: ver e controlar notificações de um viewer específico (usuário que ela criou)
+app.get("/api/users/:id/notification-settings", requireAuth, async (req, res) => {
+  if (req.user.role !== "owner") return res.status(403).json({ error: "Sem permissão" });
+  const viewerId = Number(req.params.id);
+  const owns = await query("SELECT id FROM users WHERE id=$1 AND owner_id=$2", [viewerId, req.user.id]);
+  if (!owns.rows[0]) return res.status(403).json({ error: "Este usuário não é seu" });
+  const r = await query("SELECT * FROM notification_settings WHERE user_id=$1", [viewerId]);
+  res.json(r.rows[0] || { notify_midnight: true, notify_hours_before: 0, notify_tags: true });
+});
+
+app.put("/api/users/:id/notification-settings", requireAuth, async (req, res) => {
+  if (req.user.role !== "owner") return res.status(403).json({ error: "Sem permissão" });
+  const viewerId = Number(req.params.id);
+  const owns = await query("SELECT id FROM users WHERE id=$1 AND owner_id=$2", [viewerId, req.user.id]);
+  if (!owns.rows[0]) return res.status(403).json({ error: "Este usuário não é seu" });
+  const { notify_midnight, notify_hours_before, notify_tags } = req.body;
+  await query(`
+    INSERT INTO notification_settings (user_id, notify_midnight, notify_hours_before, notify_tags)
+    VALUES ($1,$2,$3,$4)
+    ON CONFLICT (user_id) DO UPDATE SET
+      notify_midnight=$2, notify_hours_before=$3, notify_tags=$4
+  `, [viewerId, notify_midnight ?? true, notify_hours_before ?? 0, notify_tags ?? true]);
   res.json({ success: true });
 });
 
