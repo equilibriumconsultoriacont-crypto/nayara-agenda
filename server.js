@@ -90,6 +90,17 @@ async function setupDB() {
     )
   `);
 
+  await query(`
+    CREATE TABLE IF NOT EXISTS notification_settings (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL UNIQUE,
+      notify_midnight BOOLEAN DEFAULT true,
+      notify_hours_before INTEGER DEFAULT 0,
+      notify_tags BOOLEAN DEFAULT true,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
   // Admin padrão
   const existing = await query("SELECT id FROM users WHERE email = $1", ["nayara.hummel@icloud.com"]);
   if (existing.rows.length === 0) {
@@ -123,36 +134,83 @@ async function sendPushToAll(ownerId, title, body) {
   }
 }
 
-// ── Cron: todo dia à meia-noite ───────────────────────────────────────────────
-cron.schedule("0 0 * * *", async () => {
-  console.log("[CRON] Enviando notificações de meia-noite...");
-  const todayStr = new Date().toISOString().slice(0, 10);
+// ── Helpers de notificação ───────────────────────────────────────────────────
+async function buildShiftMessage(ownerId, dateStr) {
+  const shift = await query("SELECT * FROM shifts WHERE owner_id=$1 AND date=$2", [ownerId, dateStr]);
+  const s = shift.rows[0];
+  let body;
+  if (!s) {
+    body = "Nenhum turno registrado.";
+  } else if (s.type === "off") {
+    body = "🌙 FOLGA! Descanse bem 😴";
+  } else {
+    const tipo = s.type === "plantao" ? "🏥 Plantão" : "💼 Trabalho";
+    body = `${tipo}${s.start_time ? ` das ${s.start_time}` : ""}${s.end_time ? ` às ${s.end_time}` : ""}${s.hours ? ` · ${s.hours}h` : ""}`;
+  }
+  return { body, hasShift: !!s, shift: s };
+}
+
+async function sendNotificationsForDate(dateStr) {
   const owners = await query("SELECT id, name FROM users WHERE role='owner'");
   for (const owner of owners.rows) {
-    const shift = await query("SELECT * FROM shifts WHERE owner_id=$1 AND date=$2", [owner.id, todayStr]);
-    const s = shift.rows[0];
-    const title = "📅 Sua agenda de hoje";
-    let body;
-    if (!s) {
-      body = "Nenhum turno registrado para hoje.";
-    } else if (s.type === "off") {
-      body = "🌙 Hoje você está de FOLGA! Descanse bem 😴";
-    } else {
-      const tipo = s.type === "plantao" ? "🏥 Plantão" : "💼 Trabalho";
-      body = `${tipo}${s.start_time ? ` das ${s.start_time}` : ""}${s.end_time ? ` às ${s.end_time}` : ""}${s.hours ? ` · ${s.hours}h` : ""}`;
+    const { body, shift } = await buildShiftMessage(owner.id, dateStr);
+    const settings = await query("SELECT * FROM notification_settings WHERE user_id=$1", [owner.id]);
+    const s = settings.rows[0] || { notify_midnight: true, notify_tags: true };
+
+    let fullBody = body;
+    if (s.notify_tags && shift) {
+      const tagsR = await query(`
+        SELECT t.name, t.emoji, st.start_time FROM shift_tags st
+        JOIN tags t ON t.id = st.tag_id WHERE st.owner_id=$1 AND st.date=$2
+      `, [owner.id, dateStr]);
+      if (tagsR.rows.length > 0) {
+        fullBody += "\n" + tagsR.rows.map(t => `${t.emoji} ${t.name}${t.start_time ? ` às ${t.start_time}` : ""}`).join(" · ");
+      }
     }
-    // Buscar tags do dia
-    const tagsR = await query(`
-      SELECT t.name, t.emoji, st.start_time, st.end_time, st.notes
-      FROM shift_tags st JOIN tags t ON t.id = st.tag_id
-      WHERE st.owner_id=$1 AND st.date=$2
-    `, [owner.id, todayStr]);
-    if (tagsR.rows.length > 0) {
-      body += "\n" + tagsR.rows.map(t =>
-        `${t.emoji} ${t.name}${t.start_time ? ` às ${t.start_time}` : ""}`
-      ).join(" · ");
+
+    const title = `📅 Agenda — ${new Date(dateStr + "T12:00:00").toLocaleDateString("pt-BR", { weekday: "short", day: "2-digit", month: "2-digit" })}`;
+
+    // Busca todos os usuários que devem receber (owner + viewers com configuração ativa)
+    const viewers = await query("SELECT u.id, ns.notify_midnight, ns.notify_tags FROM users u LEFT JOIN notification_settings ns ON ns.user_id = u.id WHERE u.owner_id=$1", [owner.id]);
+    const allUsers = [{ id: owner.id, notify: true }, ...viewers.rows.map(v => ({ id: v.id, notify: v.notify_midnight !== false }))];
+
+    for (const u of allUsers) {
+      if (!u.notify) continue;
+      const subR = await query("SELECT subscription FROM push_subscriptions WHERE user_id=$1", [u.id]);
+      if (!subR.rows[0]) continue;
+      try {
+        await webpush.sendNotification(JSON.parse(subR.rows[0].subscription), JSON.stringify({ title, body: fullBody, icon: "/icon.svg" }));
+      } catch (e) {
+        if (e.statusCode === 410) await query("DELETE FROM push_subscriptions WHERE user_id=$1", [u.id]);
+      }
     }
-    await sendPushToAll(owner.id, title, body);
+  }
+}
+
+// ── Cron: todo dia à meia-noite (agenda do dia) ───────────────────────────────
+cron.schedule("0 0 * * *", async () => {
+  console.log("[CRON 00:00] Notificações do dia...");
+  const todayStr = new Date().toISOString().slice(0, 10);
+  await sendNotificationsForDate(todayStr);
+}, { timezone: "America/Sao_Paulo" });
+
+// ── Cron: a cada hora — verifica notificações antecipadas ────────────────────
+cron.schedule("0 * * * *", async () => {
+  const now = new Date();
+  const currentHour = now.getHours();
+  const owners = await query("SELECT id FROM users WHERE role='owner'");
+  for (const owner of owners.rows) {
+    const settings = await query("SELECT notify_hours_before FROM notification_settings WHERE user_id=$1", [owner.id]);
+    const hoursB = settings.rows[0]?.notify_hours_before || 0;
+    if (!hoursB) continue;
+    // Calcula a data alvo: hoje + hoursB horas
+    const target = new Date(now);
+    target.setHours(now.getHours() + hoursB);
+    const targetDate = target.toISOString().slice(0, 10);
+    // Só dispara se currentHour === 0 (início do dia alvo com X horas de antecedência)
+    if (currentHour === (24 - hoursB) % 24) {
+      await sendNotificationsForDate(targetDate);
+    }
   }
 }, { timezone: "America/Sao_Paulo" });
 
@@ -345,6 +403,23 @@ app.post("/api/push/subscribe", requireAuth, async (req, res) => {
   res.json({ success: true });
 });
 app.get("/api/push/vapid-key", (_, res) => res.json({ publicKey: VAPID_PUBLIC }));
+
+// Notification settings
+app.get("/api/notification-settings", requireAuth, async (req, res) => {
+  const r = await query("SELECT * FROM notification_settings WHERE user_id=$1", [req.user.id]);
+  res.json(r.rows[0] || { notify_midnight: true, notify_hours_before: 0, notify_tags: true });
+});
+
+app.put("/api/notification-settings", requireAuth, async (req, res) => {
+  const { notify_midnight, notify_hours_before, notify_tags } = req.body;
+  await query(`
+    INSERT INTO notification_settings (user_id, notify_midnight, notify_hours_before, notify_tags)
+    VALUES ($1,$2,$3,$4)
+    ON CONFLICT (user_id) DO UPDATE SET
+      notify_midnight=$2, notify_hours_before=$3, notify_tags=$4
+  `, [req.user.id, notify_midnight ?? true, notify_hours_before ?? 0, notify_tags ?? true]);
+  res.json({ success: true });
+});
 
 // SPA fallback
 app.get("*", (req, res) => {
