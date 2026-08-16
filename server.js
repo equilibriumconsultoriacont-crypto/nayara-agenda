@@ -2,6 +2,7 @@ import express from "express";
 import cookieParser from "cookie-parser";
 import bcrypt from "bcryptjs";
 import { SignJWT, jwtVerify } from "jose";
+import { randomBytes } from "crypto";
 import pg from "pg";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
@@ -101,27 +102,115 @@ async function setupDB() {
     )
   `);
 
-  // Migração aditiva: responsável por um lembrete num dia (viewer marcado).
+  // Migração aditiva: responsável por um lembrete num dia.
   await query(`ALTER TABLE shift_tags ADD COLUMN IF NOT EXISTS assigned_user_id INTEGER`);
 
-  // Admin padrão
+  // Cor personalizada por turno (opcional; se null, usa a cor do tipo).
+  await query(`ALTER TABLE shifts ADD COLUMN IF NOT EXISTS color TEXT`);
+
+  // Flag "tem agenda própria" (é dono). Migra os antigos role='owner'.
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_owner BOOLEAN DEFAULT false`);
+  await query(`UPDATE users SET is_owner = true WHERE role = 'owner'`);
+
+  // Acessos de agenda (quem vê a agenda de quem) — N:N.
+  await query(`
+    CREATE TABLE IF NOT EXISTS agenda_access (
+      id SERIAL PRIMARY KEY,
+      owner_id INTEGER NOT NULL,
+      viewer_id INTEGER NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(owner_id, viewer_id)
+    )
+  `);
+  // Migra vínculos antigos (users.owner_id) para agenda_access.
+  await query(`
+    INSERT INTO agenda_access (owner_id, viewer_id)
+    SELECT owner_id, id FROM users WHERE owner_id IS NOT NULL
+    ON CONFLICT DO NOTHING
+  `);
+
+  // Convites por link.
+  await query(`
+    CREATE TABLE IF NOT EXISTS invites (
+      id SERIAL PRIMARY KEY,
+      owner_id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      token TEXT NOT NULL UNIQUE,
+      used_by INTEGER,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
+  // Horários padrões (presets) com cor, por dono.
+  await query(`
+    CREATE TABLE IF NOT EXISTS shift_presets (
+      id SERIAL PRIMARY KEY,
+      owner_id INTEGER NOT NULL,
+      label TEXT NOT NULL,
+      type TEXT NOT NULL DEFAULT 'work',
+      start_time TEXT,
+      end_time TEXT,
+      hours INTEGER,
+      color TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
+  // Admin padrão (dona da 1ª agenda).
   const existing = await query("SELECT id FROM users WHERE email = $1", ["nayara.hummel@icloud.com"]);
   if (existing.rows.length === 0) {
     const hash = bcrypt.hashSync("26092000Nay.", 10);
-    await query("INSERT INTO users (name, email, password_hash, role) VALUES ($1,$2,$3,$4)",
-      ["Nayara", "nayara.hummel@icloud.com", hash, "owner"]);
+    await query("INSERT INTO users (name, email, password_hash, role, is_owner) VALUES ($1,$2,$3,'owner',true)",
+      ["Nayara", "nayara.hummel@icloud.com", hash]);
     console.log("✅ Usuário Nayara criado!");
   }
   console.log("✅ Banco configurado!");
 }
 
+// ── Helpers de agenda/acesso ─────────────────────────────────────────────────
+// Data de hoje (YYYY-MM-DD) no fuso de Brasília.
+function ymdBrasilia(d = new Date()) {
+  const p = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Sao_Paulo", year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(d);
+  const g = (t) => p.find((x) => x.type === t).value;
+  return `${g("year")}-${g("month")}-${g("day")}`;
+}
+
+async function canViewAgenda(userId, ownerId) {
+  if (userId === ownerId) return true;
+  const r = await query("SELECT 1 FROM agenda_access WHERE owner_id=$1 AND viewer_id=$2", [ownerId, userId]);
+  return r.rows.length > 0;
+}
+
+// Agendas que o usuário pode abrir: a própria (se dono) + as que foi convidado.
+async function listAgendas(userId) {
+  const r = await query(`
+    SELECT u.id AS owner_id, u.name, (u.id = $1) AS is_mine
+    FROM users u
+    WHERE (u.id = $1 AND u.is_owner = true)
+       OR u.id IN (SELECT owner_id FROM agenda_access WHERE viewer_id = $1)
+    ORDER BY is_mine DESC, u.name
+  `, [userId]);
+  return r.rows.map((x) => ({ ownerId: x.owner_id, name: x.name, isMine: x.is_mine }));
+}
+
+// Destinatários das notificações da agenda de um dono: ele + quem tem acesso.
+async function agendaRecipients(ownerId) {
+  const r = await query(`
+    SELECT u.id, ns.notify_midnight, ns.notify_tags, ns.notify_hours_before
+    FROM users u
+    LEFT JOIN notification_settings ns ON ns.user_id = u.id
+    WHERE u.id = $1 OR u.id IN (SELECT viewer_id FROM agenda_access WHERE owner_id = $1)
+  `, [ownerId]);
+  return r.rows;
+}
+
 // ── Web Push ──────────────────────────────────────────────────────────────────
-// Par VAPID próprio da Agenda Nayara (fallback). Pode ser sobreposto por env vars no Render.
 const VAPID_PUBLIC = process.env.VAPID_PUBLIC_KEY || "BAmHwEDX2z4sXxHRhDIqgHNhPMiExlb6OgmKiikYfYeUl9uYfJ85hOnZMkTQXxqwwTBkgEPL9ylc5T5stGnzTtA";
 const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || "7DvvdX-i5QOH41TkofiEECK33v1n7KZgxr1tnv000UA";
 webpush.setVapidDetails("mailto:nayara.hummel@icloud.com", VAPID_PUBLIC, VAPID_PRIVATE);
 
-// Envia um push para UM usuário específico. Retorna true se havia inscrição e o envio saiu.
 async function sendPushToUser(userId, title, body) {
   const subR = await query("SELECT subscription FROM push_subscriptions WHERE user_id=$1", [userId]);
   if (!subR.rows[0]) return false;
@@ -132,7 +221,6 @@ async function sendPushToUser(userId, title, body) {
     );
     return true;
   } catch (e) {
-    // 410/404 = inscrição expirada/removida no navegador → limpa
     if (e.statusCode === 410 || e.statusCode === 404) {
       await query("DELETE FROM push_subscriptions WHERE user_id=$1", [userId]);
     } else {
@@ -142,7 +230,7 @@ async function sendPushToUser(userId, title, body) {
   }
 }
 
-// ── Helpers de notificação ───────────────────────────────────────────────────
+// ── Mensagem do turno ────────────────────────────────────────────────────────
 async function buildShiftMessage(ownerId, dateStr) {
   const shift = await query("SELECT * FROM shifts WHERE owner_id=$1 AND date=$2", [ownerId, dateStr]);
   const s = shift.rows[0];
@@ -158,12 +246,12 @@ async function buildShiftMessage(ownerId, dateStr) {
   return { body, hasShift: !!s, shift: s };
 }
 
+// Resumo do dia (00:00) — turno + lembretes — para o dono e quem tem acesso.
 async function sendNotificationsForDate(dateStr) {
-  const owners = await query("SELECT id, name FROM users WHERE role='owner'");
+  const owners = await query("SELECT id FROM users WHERE is_owner = true");
   for (const owner of owners.rows) {
     const { body, shift } = await buildShiftMessage(owner.id, dateStr);
 
-    // Lembretes (tags) do dia — buscados SEMPRE, mesmo sem turno registrado.
     const tagsR = await query(`
       SELECT t.name, t.emoji, st.start_time FROM shift_tags st
       JOIN tags t ON t.id = st.tag_id WHERE st.owner_id=$1 AND st.date=$2
@@ -174,84 +262,74 @@ async function sendNotificationsForDate(dateStr) {
       ? tagsR.rows.map(t => `${t.emoji} ${t.name}${t.start_time ? ` às ${t.start_time}` : ""}`).join(" · ")
       : "";
 
-    // Dia totalmente vazio (sem turno e sem lembrete) → não notifica (evita "nenhum turno" todo dia).
-    if (!shift && !hasTags) continue;
+    if (!shift && !hasTags) continue; // dia vazio → não incomoda
 
     const title = `📅 Agenda — ${new Date(dateStr + "T12:00:00").toLocaleDateString("pt-BR", { weekday: "short", day: "2-digit", month: "2-digit" })}`;
 
-    // Owner + viewers, cada um respeitando as próprias preferências.
-    const ownerSettings = await query("SELECT notify_tags FROM notification_settings WHERE user_id=$1", [owner.id]);
-    const viewers = await query("SELECT u.id, ns.notify_midnight, ns.notify_tags FROM users u LEFT JOIN notification_settings ns ON ns.user_id = u.id WHERE u.owner_id=$1", [owner.id]);
-    const recipients = [
-      { id: owner.id, notify: true, notifyTags: ownerSettings.rows[0]?.notify_tags !== false },
-      ...viewers.rows.map(v => ({ id: v.id, notify: v.notify_midnight !== false, notifyTags: v.notify_tags !== false })),
-    ];
-
-    for (const u of recipients) {
-      if (!u.notify) continue;
+    const recips = await agendaRecipients(owner.id);
+    for (const u of recips) {
+      if (u.notify_midnight === false) continue;
       let fullBody = shift ? body : "";
-      if (u.notifyTags && tagsLine) fullBody += (fullBody ? "\n" : "") + tagsLine;
-      if (!fullBody) fullBody = body; // fallback (ex.: só lembrete mas viewer com tags off)
+      if (u.notify_tags !== false && tagsLine) fullBody += (fullBody ? "\n" : "") + tagsLine;
+      if (!fullBody) fullBody = body;
       await sendPushToUser(u.id, title, fullBody);
     }
   }
 }
 
-// ── Cron: todo dia à meia-noite (agenda do dia) ───────────────────────────────
+// ── Cron: 00:00 — resumo do dia ───────────────────────────────────────────────
 cron.schedule("0 0 * * *", async () => {
-  console.log("[CRON 00:00] Notificações do dia...");
-  const todayStr = new Date().toISOString().slice(0, 10);
-  await sendNotificationsForDate(todayStr);
+  console.log("[CRON 00:00] Resumo do dia...");
+  await sendNotificationsForDate(ymdBrasilia());
 }, { timezone: "America/Sao_Paulo" });
 
-// ── Cron: a cada hora — verifica notificações antecipadas ────────────────────
-// Roda a cada hora cheia. Para cada owner, olha o horário local dele (Brasília)
-// e dispara o aviso do dia seguinte quando faltar exatamente X horas para 00:00.
-cron.schedule("0 * * * *", async () => {
-  // Hora atual em Brasília, independente do timezone do servidor
-  const nowBrasilia = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Sao_Paulo" }));
-  const currentHour = nowBrasilia.getHours();
-
-  const owners = await query("SELECT id FROM users WHERE role='owner'");
-  for (const owner of owners.rows) {
-    const settings = await query("SELECT notify_hours_before FROM notification_settings WHERE user_id=$1", [owner.id]);
-    const hoursB = settings.rows[0]?.notify_hours_before || 0;
-    if (!hoursB) continue;
-
-    // Se "3 horas antes" está configurado, dispara às 21h (24-3) avisando sobre AMANHÃ
-    const triggerHour = (24 - hoursB) % 24;
-    if (currentHour !== triggerHour) continue;
-
-    const tomorrow = new Date(nowBrasilia);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    const y = tomorrow.getFullYear();
-    const m = String(tomorrow.getMonth() + 1).padStart(2, "0");
-    const d = String(tomorrow.getDate()).padStart(2, "0");
-    await sendNotificationsForDate(`${y}-${m}-${d}`);
-  }
-});
-
-// ── Cron: a cada minuto — lembrete de tag com responsável, 2h antes do horário ─
+// ── Cron: a cada minuto — avisos por horário do próprio evento ────────────────
+// (a) "X horas antes" do INÍCIO do turno (ex.: turno 18:00 + "1h antes" → 17:00 do MESMO dia).
+// (b) lembrete de tag com responsável, 2h antes do horário da tag.
 cron.schedule("* * * * *", async () => {
   const nowB = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Sao_Paulo" }));
-  const target = new Date(nowB.getTime() + 2 * 60 * 60 * 1000); // agora + 2h
-  const hh = String(target.getHours()).padStart(2, "0");
-  const mm = String(target.getMinutes()).padStart(2, "0");
-  const todayStr = `${nowB.getFullYear()}-${String(nowB.getMonth() + 1).padStart(2, "0")}-${String(nowB.getDate()).padStart(2, "0")}`;
+  const nowMin = nowB.getHours() * 60 + nowB.getMinutes();
+  const todayStr = ymdBrasilia();
+
   try {
-    const rows = await query(`
+    // (a) turno: início − notify_hours_before de cada destinatário
+    const owners = await query("SELECT id FROM users WHERE is_owner = true");
+    for (const owner of owners.rows) {
+      const sR = await query("SELECT * FROM shifts WHERE owner_id=$1 AND date=$2", [owner.id, todayStr]);
+      const s = sR.rows[0];
+      if (!s || s.type === "off" || !s.start_time) continue;
+      const [sh, sm] = s.start_time.split(":").map(Number);
+      const startMin = sh * 60 + sm;
+      const recips = await agendaRecipients(owner.id);
+      for (const u of recips) {
+        const hb = u.notify_hours_before || 0;
+        if (!hb) continue;
+        const targetMin = startMin - hb * 60;
+        if (targetMin < 0) continue; // cruzaria a meia-noite → já coberto pelo aviso das 00:00
+        if (targetMin === nowMin) {
+          const tipo = s.type === "plantao" ? "🏥 Plantão" : "💼 Trabalho";
+          const quando = hb === 1 ? "Falta 1 hora" : `Faltam ${hb} horas`;
+          await sendPushToUser(u.id, `⏰ ${quando}`, `${tipo} às ${s.start_time}${s.end_time ? ` – ${s.end_time}` : ""}`);
+        }
+      }
+    }
+
+    // (b) tag com responsável: 2h antes do horário da tag
+    const target = new Date(nowB.getTime() + 2 * 60 * 60 * 1000);
+    const hh = String(target.getHours()).padStart(2, "0");
+    const mm = String(target.getMinutes()).padStart(2, "0");
+    const tagRows = await query(`
       SELECT st.assigned_user_id, st.start_time, t.name, t.emoji
       FROM shift_tags st JOIN tags t ON t.id = st.tag_id
       WHERE st.date=$1 AND st.assigned_user_id IS NOT NULL AND st.start_time=$2
     `, [todayStr, `${hh}:${mm}`]);
-    for (const r of rows.rows) {
+    for (const r of tagRows.rows) {
       await sendPushToUser(r.assigned_user_id, "⏰ Faltam 2 horas", `${r.emoji || "🏷️"} ${r.name} às ${r.start_time}`);
     }
-  } catch (e) { console.warn("[cron 2h tag]", e?.message); }
+  } catch (e) { console.warn("[cron minuto]", e?.message); }
 }, { timezone: "America/Sao_Paulo" });
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
-// Segundos até a próxima meia-noite no horário de Brasília.
 function secondsUntilBrasiliaMidnight() {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/Sao_Paulo", hourCycle: "h23",
@@ -262,7 +340,6 @@ function secondsUntilBrasiliaMidnight() {
   return secs <= 0 ? 24 * 3600 : secs;
 }
 
-// remember=true → 30 dias; senão → expira na próxima meia-noite (derruba todo dia).
 async function signToken(userId, remember) {
   const jwt = new SignJWT({ sub: String(userId) }).setProtectedHeader({ alg: "HS256" });
   if (remember) jwt.setExpirationTime("30d");
@@ -284,6 +361,21 @@ async function requireAuth(req, res, next) {
   next();
 }
 
+function setSessionCookie(res, token, remember) {
+  res.cookie(COOKIE, token, {
+    httpOnly: true, secure: process.env.NODE_ENV === "production", sameSite: "lax",
+    maxAge: (remember ? 30 * 24 * 60 * 60 : secondsUntilBrasiliaMidnight()) * 1000,
+  });
+}
+
+async function publicUser(u) {
+  return {
+    id: u.id, name: u.name, email: u.email, role: u.role,
+    ownerId: u.owner_id ?? null, isOwner: !!u.is_owner,
+    agendas: await listAgendas(u.id),
+  };
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json());
@@ -302,53 +394,122 @@ app.post("/api/login", async (req, res) => {
   const user = r.rows[0];
   if (!user || !bcrypt.compareSync(password, user.password_hash))
     return res.status(401).json({ error: "Credenciais inválidas" });
-  const token = await signToken(user.id, !!remember);
-  res.cookie(COOKIE, token, {
-    httpOnly: true, secure: process.env.NODE_ENV === "production", sameSite: "lax",
-    maxAge: (remember ? 30 * 24 * 60 * 60 : secondsUntilBrasiliaMidnight()) * 1000,
-  });
-  res.json({ success: true, user: { id: user.id, name: user.name, email: user.email, role: user.role, ownerId: user.owner_id } });
+  setSessionCookie(res, await signToken(user.id, !!remember), !!remember);
+  res.json({ success: true, user: await publicUser(user) });
 });
 app.post("/api/logout", (req, res) => { res.clearCookie(COOKIE); res.json({ success: true }); });
-app.get("/api/me", requireAuth, (req, res) => {
-  const { id, name, email, role, owner_id } = req.user;
-  res.json({ id, name, email, role, ownerId: owner_id });
+app.get("/api/me", requireAuth, async (req, res) => {
+  res.json(await publicUser(req.user));
 });
 
-// Users
-app.get("/api/users", requireAuth, async (req, res) => {
-  if (req.user.role !== "owner") return res.status(403).json({ error: "Sem permissão" });
-  const r = await query("SELECT id,name,email,role,created_at FROM users WHERE owner_id=$1", [req.user.id]);
-  res.json(r.rows);
+// Convite: dados públicos p/ a tela de cadastro
+app.get("/api/invite/:token", async (req, res) => {
+  const r = await query(
+    "SELECT i.name, i.used_by, u.name AS owner_name FROM invites i JOIN users u ON u.id=i.owner_id WHERE i.token=$1",
+    [req.params.token]
+  );
+  const inv = r.rows[0];
+  if (!inv) return res.status(404).json({ error: "Convite inválido" });
+  if (inv.used_by) return res.status(410).json({ error: "Este convite já foi usado" });
+  res.json({ name: inv.name, ownerName: inv.owner_name });
 });
-app.post("/api/users", requireAuth, async (req, res) => {
-  if (req.user.role !== "owner") return res.status(403).json({ error: "Sem permissão" });
-  const { name, email, password } = req.body;
-  if (!name || !email || !password) return res.status(400).json({ error: "Todos os campos são obrigatórios" });
-  const ex = await query("SELECT id FROM users WHERE email=$1", [email.trim().toLowerCase()]);
+
+// Cadastro via convite: cria a conta e já libera o acesso à agenda de quem convidou.
+app.post("/api/register", async (req, res) => {
+  const { token, email, password, name } = req.body;
+  if (!token || !email || !password) return res.status(400).json({ error: "Preencha e-mail e senha" });
+  if (String(password).length < 6) return res.status(400).json({ error: "Senha de no mínimo 6 caracteres" });
+  const invR = await query("SELECT * FROM invites WHERE token=$1", [token]);
+  const inv = invR.rows[0];
+  if (!inv) return res.status(404).json({ error: "Convite inválido" });
+  if (inv.used_by) return res.status(410).json({ error: "Este convite já foi usado" });
+  const emailN = email.trim().toLowerCase();
+  const ex = await query("SELECT id FROM users WHERE email=$1", [emailN]);
   if (ex.rows.length > 0) return res.status(400).json({ error: "E-mail já cadastrado" });
   const hash = bcrypt.hashSync(password, 10);
-  const r = await query(
-    "INSERT INTO users (name,email,password_hash,role,owner_id) VALUES ($1,$2,$3,'viewer',$4) RETURNING id",
-    [name, email.trim().toLowerCase(), hash, req.user.id]
+  const uR = await query(
+    "INSERT INTO users (name,email,password_hash,role,is_owner) VALUES ($1,$2,$3,'viewer',false) RETURNING *",
+    [(name && name.trim()) || inv.name, emailN, hash]
   );
-  res.json({ success: true, id: r.rows[0].id });
+  const newUser = uR.rows[0];
+  await query("INSERT INTO agenda_access (owner_id, viewer_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [inv.owner_id, newUser.id]);
+  await query("UPDATE invites SET used_by=$1 WHERE id=$2", [newUser.id, inv.id]);
+  setSessionCookie(res, await signToken(newUser.id, false), false);
+  res.json({ success: true, user: await publicUser(newUser) });
 });
-app.delete("/api/users/:id", requireAuth, async (req, res) => {
-  if (req.user.role !== "owner") return res.status(403).json({ error: "Sem permissão" });
-  await query("DELETE FROM users WHERE id=$1 AND owner_id=$2", [Number(req.params.id), req.user.id]);
+
+// "Criar minha agenda": um convidado vira dono da própria agenda (mantém os acessos que já tem).
+app.post("/api/agenda/activate", requireAuth, async (req, res) => {
+  await query("UPDATE users SET is_owner=true WHERE id=$1", [req.user.id]);
+  const fresh = await query("SELECT * FROM users WHERE id=$1", [req.user.id]);
+  res.json({ success: true, user: await publicUser(fresh.rows[0]) });
+});
+
+// ── Convites (dono da agenda) ─────────────────────────────────────────────────
+app.post("/api/invites", requireAuth, async (req, res) => {
+  if (!req.user.is_owner) return res.status(403).json({ error: "Ative sua agenda primeiro" });
+  const { name } = req.body;
+  if (!name || !name.trim()) return res.status(400).json({ error: "Informe um nome" });
+  const token = randomBytes(16).toString("hex");
+  await query("INSERT INTO invites (owner_id,name,token) VALUES ($1,$2,$3)", [req.user.id, name.trim(), token]);
+  res.json({ token });
+});
+app.get("/api/invites", requireAuth, async (req, res) => {
+  const r = await query(
+    `SELECT i.id, i.name, i.token, u.name AS used_by_name
+     FROM invites i LEFT JOIN users u ON u.id = i.used_by
+     WHERE i.owner_id=$1 ORDER BY i.created_at DESC`,
+    [req.user.id]
+  );
+  res.json(r.rows.map(x => ({ id: x.id, name: x.name, token: x.token, used: !!x.used_by_name, usedByName: x.used_by_name })));
+});
+app.delete("/api/invites/:id", requireAuth, async (req, res) => {
+  await query("DELETE FROM invites WHERE id=$1 AND owner_id=$2", [Number(req.params.id), req.user.id]);
   res.json({ success: true });
 });
 
-// Shifts
-function getOwnerId(user) { return user.role === "owner" ? user.id : user.owner_id; }
+// ── Pessoas com acesso à MINHA agenda ─────────────────────────────────────────
+app.get("/api/users", requireAuth, async (req, res) => {
+  if (!req.user.is_owner) return res.json([]);
+  const r = await query(
+    `SELECT u.id, u.name, u.email FROM agenda_access a JOIN users u ON u.id = a.viewer_id
+     WHERE a.owner_id=$1 ORDER BY u.name`,
+    [req.user.id]
+  );
+  res.json(r.rows);
+});
+// Remove o ACESSO de alguém (não apaga a conta da pessoa).
+app.delete("/api/users/:id", requireAuth, async (req, res) => {
+  await query("DELETE FROM agenda_access WHERE owner_id=$1 AND viewer_id=$2", [req.user.id, Number(req.params.id)]);
+  res.json({ success: true });
+});
 
-// IMPORTANTE: esta rota específica precisa vir ANTES de "/api/shifts/:year/:month",
-// senão o Express casa "/api/shifts/2026-08-15/detail" como year=2026-08-15 / month=detail
-// e o detalhe nunca roda (bug que fazia o dia sempre aparecer "sem turno").
+// ── Horários padrões (presets) ────────────────────────────────────────────────
+app.get("/api/presets", requireAuth, async (req, res) => {
+  const r = await query("SELECT * FROM shift_presets WHERE owner_id=$1 ORDER BY start_time NULLS LAST, id", [req.user.id]);
+  res.json(r.rows);
+});
+app.post("/api/presets", requireAuth, async (req, res) => {
+  if (!req.user.is_owner) return res.status(403).json({ error: "Ative sua agenda primeiro" });
+  const { label, type, startTime, endTime, hours, color } = req.body;
+  if (!label || !label.trim()) return res.status(400).json({ error: "Informe um nome" });
+  const r = await query(
+    "INSERT INTO shift_presets (owner_id,label,type,start_time,end_time,hours,color) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *",
+    [req.user.id, label.trim(), type || "work", startTime || null, endTime || null, hours || null, color || null]
+  );
+  res.json(r.rows[0]);
+});
+app.delete("/api/presets/:id", requireAuth, async (req, res) => {
+  await query("DELETE FROM shift_presets WHERE id=$1 AND owner_id=$2", [Number(req.params.id), req.user.id]);
+  res.json({ success: true });
+});
+
+// ── Shifts ────────────────────────────────────────────────────────────────────
+// Detalhe do dia (rota específica ANTES da genérica :year/:month).
 app.get("/api/shifts/:date/detail", requireAuth, async (req, res) => {
   try {
-    const ownerId = getOwnerId(req.user);
+    const ownerId = Number(req.query.owner) || req.user.id;
+    if (!(await canViewAgenda(req.user.id, ownerId))) return res.status(403).json({ error: "Sem acesso" });
     const { date } = req.params;
     const [shiftR, tagsR] = await Promise.all([
       query("SELECT * FROM shifts WHERE owner_id=$1 AND date=$2", [ownerId, date]),
@@ -369,8 +530,9 @@ app.get("/api/shifts/:date/detail", requireAuth, async (req, res) => {
 });
 
 app.get("/api/shifts/:year/:month", requireAuth, async (req, res) => {
-  const ownerId = getOwnerId(req.user);
-  const prefix = `${req.params.year}-${String(req.params.month).padStart(2,"0")}`;
+  const ownerId = Number(req.query.owner) || req.user.id;
+  if (!(await canViewAgenda(req.user.id, ownerId))) return res.status(403).json({ error: "Sem acesso" });
+  const prefix = `${req.params.year}-${String(req.params.month).padStart(2, "0")}`;
   const [shiftsR, tagsR] = await Promise.all([
     query("SELECT * FROM shifts WHERE owner_id=$1 AND date LIKE $2", [ownerId, `${prefix}%`]),
     query(`
@@ -381,7 +543,6 @@ app.get("/api/shifts/:year/:month", requireAuth, async (req, res) => {
       WHERE st.owner_id=$1 AND st.date LIKE $2
     `, [ownerId, `${prefix}%`]),
   ]);
-  // Group tags by date
   const tagsByDate = {};
   tagsR.rows.forEach(t => {
     if (!tagsByDate[t.date]) tagsByDate[t.date] = [];
@@ -390,63 +551,67 @@ app.get("/api/shifts/:year/:month", requireAuth, async (req, res) => {
   res.json({ shifts: shiftsR.rows, tagsByDate });
 });
 
+// Edição sempre na PRÓPRIA agenda (owner_id = usuário logado).
 app.put("/api/shifts/:date", requireAuth, async (req, res) => {
-  if (req.user.role !== "owner") return res.status(403).json({ error: "Sem permissão" });
+  if (!req.user.is_owner) return res.status(403).json({ error: "Sem permissão" });
   const { date } = req.params;
-  const { type, startTime, endTime, hours, notes } = req.body;
+  const { type, startTime, endTime, hours, notes, color } = req.body;
   await query(`
-    INSERT INTO shifts (owner_id,date,type,start_time,end_time,hours,notes)
-    VALUES ($1,$2,$3,$4,$5,$6,$7)
+    INSERT INTO shifts (owner_id,date,type,start_time,end_time,hours,notes,color)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
     ON CONFLICT (owner_id,date) DO UPDATE SET
-      type=$3,start_time=$4,end_time=$5,hours=$6,notes=$7,updated_at=NOW()
-  `, [req.user.id, date, type, startTime||null, endTime||null, hours||null, notes||null]);
+      type=$3,start_time=$4,end_time=$5,hours=$6,notes=$7,color=$8,updated_at=NOW()
+  `, [req.user.id, date, type, startTime || null, endTime || null, hours || null, notes || null, color || null]);
   const r = await query("SELECT * FROM shifts WHERE owner_id=$1 AND date=$2", [req.user.id, date]);
   res.json(r.rows[0]);
 });
 
 app.delete("/api/shifts/:date", requireAuth, async (req, res) => {
-  if (req.user.role !== "owner") return res.status(403).json({ error: "Sem permissão" });
+  if (!req.user.is_owner) return res.status(403).json({ error: "Sem permissão" });
   await query("DELETE FROM shifts WHERE owner_id=$1 AND date=$2", [req.user.id, req.params.date]);
   res.json({ success: true });
 });
 
-// Tags
+// ── Tags ──────────────────────────────────────────────────────────────────────
 app.get("/api/tags", requireAuth, async (req, res) => {
-  const ownerId = getOwnerId(req.user);
+  const ownerId = Number(req.query.owner) || req.user.id;
+  if (!(await canViewAgenda(req.user.id, ownerId))) return res.status(403).json({ error: "Sem acesso" });
   const r = await query("SELECT * FROM tags WHERE owner_id=$1 ORDER BY name", [ownerId]);
   res.json(r.rows);
 });
 app.post("/api/tags", requireAuth, async (req, res) => {
-  if (req.user.role !== "owner") return res.status(403).json({ error: "Sem permissão" });
+  if (!req.user.is_owner) return res.status(403).json({ error: "Sem permissão" });
   const { name, color, emoji } = req.body;
   if (!name) return res.status(400).json({ error: "Nome obrigatório" });
   const r = await query(
     "INSERT INTO tags (owner_id,name,color,emoji) VALUES ($1,$2,$3,$4) RETURNING *",
-    [req.user.id, name, color||"#6d28d9", emoji||"🏷️"]
+    [req.user.id, name, color || "#6d28d9", emoji || "🏷️"]
   );
   res.json(r.rows[0]);
 });
 app.delete("/api/tags/:id", requireAuth, async (req, res) => {
-  if (req.user.role !== "owner") return res.status(403).json({ error: "Sem permissão" });
-  await query("DELETE FROM shift_tags WHERE tag_id=$1", [Number(req.params.id)]);
+  if (!req.user.is_owner) return res.status(403).json({ error: "Sem permissão" });
+  await query("DELETE FROM shift_tags WHERE tag_id=$1 AND owner_id=$2", [Number(req.params.id), req.user.id]);
   await query("DELETE FROM tags WHERE id=$1 AND owner_id=$2", [Number(req.params.id), req.user.id]);
   res.json({ success: true });
 });
 
-// Shift Tags (tag in a specific date)
+// ── Shift Tags (tag num dia específico) ───────────────────────────────────────
 app.put("/api/shift-tags/:date/:tagId", requireAuth, async (req, res) => {
-  if (req.user.role !== "owner") return res.status(403).json({ error: "Sem permissão" });
+  if (!req.user.is_owner) return res.status(403).json({ error: "Sem permissão" });
   const { date, tagId } = req.params;
   const { startTime, endTime, notes, assignedUserId } = req.body;
 
-  // Valida o responsável: precisa ser alguém que ESTA owner liberou (viewer dela).
+  // Responsável precisa ser alguém com acesso à MINHA agenda.
   let assigned = null;
   if (assignedUserId) {
-    const v = await query("SELECT id, name FROM users WHERE id=$1 AND owner_id=$2", [Number(assignedUserId), req.user.id]);
+    const v = await query(
+      "SELECT u.id, u.name FROM agenda_access a JOIN users u ON u.id=a.viewer_id WHERE a.owner_id=$1 AND u.id=$2",
+      [req.user.id, Number(assignedUserId)]
+    );
     if (v.rows[0]) assigned = v.rows[0];
   }
 
-  // Guarda o responsável anterior p/ só notificar quando muda (evita spam ao reeditar horário).
   const prev = await query("SELECT assigned_user_id FROM shift_tags WHERE owner_id=$1 AND date=$2 AND tag_id=$3",
     [req.user.id, date, Number(tagId)]);
 
@@ -455,29 +620,25 @@ app.put("/api/shift-tags/:date/:tagId", requireAuth, async (req, res) => {
     VALUES ($1,$2,$3,$4,$5,$6,$7)
     ON CONFLICT (owner_id,date,tag_id) DO UPDATE SET
       start_time=$4,end_time=$5,notes=$6,assigned_user_id=$7
-  `, [req.user.id, date, Number(tagId), startTime||null, endTime||null, notes||null, assigned?.id || null]);
+  `, [req.user.id, date, Number(tagId), startTime || null, endTime || null, notes || null, assigned?.id || null]);
 
-  // Notificação IMEDIATA para o responsável recém-marcado.
   if (assigned && prev.rows[0]?.assigned_user_id !== assigned.id) {
     const tagR = await query("SELECT name, emoji FROM tags WHERE id=$1", [Number(tagId)]);
     const t = tagR.rows[0] || {};
     const dLabel = new Date(date + "T12:00:00").toLocaleDateString("pt-BR", { weekday: "long", day: "2-digit", month: "2-digit" });
-    await sendPushToUser(
-      assigned.id,
-      `🏷️ ${req.user.name} marcou você`,
-      `${t.emoji || "🏷️"} ${t.name}${startTime ? ` às ${startTime}` : ""} — ${dLabel}`
-    );
+    await sendPushToUser(assigned.id, `🏷️ ${req.user.name} marcou você`,
+      `${t.emoji || "🏷️"} ${t.name}${startTime ? ` às ${startTime}` : ""} — ${dLabel}`);
   }
   res.json({ success: true });
 });
 app.delete("/api/shift-tags/:date/:tagId", requireAuth, async (req, res) => {
-  if (req.user.role !== "owner") return res.status(403).json({ error: "Sem permissão" });
+  if (!req.user.is_owner) return res.status(403).json({ error: "Sem permissão" });
   await query("DELETE FROM shift_tags WHERE owner_id=$1 AND date=$2 AND tag_id=$3",
     [req.user.id, req.params.date, Number(req.params.tagId)]);
   res.json({ success: true });
 });
 
-// Push
+// ── Push ──────────────────────────────────────────────────────────────────────
 app.post("/api/push/subscribe", requireAuth, async (req, res) => {
   const sub = JSON.stringify(req.body);
   await query(`
@@ -488,34 +649,26 @@ app.post("/api/push/subscribe", requireAuth, async (req, res) => {
 });
 app.get("/api/push/vapid-key", (_, res) => res.json({ publicKey: VAPID_PUBLIC }));
 
-// Dispara uma notificação de teste imediata para o próprio usuário logado.
 app.post("/api/push/test", requireAuth, async (req, res) => {
-  const ok = await sendPushToUser(
-    req.user.id,
-    "🔔 Teste — Agenda Nayara",
-    "Deu certo! As notificações estão funcionando 🎉"
-  );
+  const ok = await sendPushToUser(req.user.id, "🔔 Teste — Agenda",
+    "Deu certo! As notificações estão funcionando 🎉");
   if (!ok) return res.status(400).json({
-    error: "Nenhuma inscrição de notificação encontrada. Toque em 'Ativar notificações' e, no iPhone, adicione o app à Tela de Início antes."
+    error: "Nenhuma inscrição de notificação neste aparelho. Toque em 'Ativar notificações' e, no iPhone, adicione o app à Tela de Início antes."
   });
   res.json({ success: true });
 });
 
-// Owner: envia agora o resumo de hoje para todos (owner + quem ela liberou). Útil para testar.
 app.post("/api/push/send-today", requireAuth, async (req, res) => {
-  if (req.user.role !== "owner") return res.status(403).json({ error: "Sem permissão" });
-  const todayStr = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Sao_Paulo" }))
-    .toISOString().slice(0, 10);
-  await sendNotificationsForDate(todayStr);
+  if (!req.user.is_owner) return res.status(403).json({ error: "Sem permissão" });
+  await sendNotificationsForDate(ymdBrasilia());
   res.json({ success: true });
 });
 
-// Notification settings — do próprio usuário logado
+// ── Notification settings (do próprio usuário) ───────────────────────────────
 app.get("/api/notification-settings", requireAuth, async (req, res) => {
   const r = await query("SELECT * FROM notification_settings WHERE user_id=$1", [req.user.id]);
   res.json(r.rows[0] || { notify_midnight: true, notify_hours_before: 0, notify_tags: true });
 });
-
 app.put("/api/notification-settings", requireAuth, async (req, res) => {
   const { notify_midnight, notify_hours_before, notify_tags } = req.body;
   await query(`
@@ -524,31 +677,6 @@ app.put("/api/notification-settings", requireAuth, async (req, res) => {
     ON CONFLICT (user_id) DO UPDATE SET
       notify_midnight=$2, notify_hours_before=$3, notify_tags=$4
   `, [req.user.id, notify_midnight ?? true, notify_hours_before ?? 0, notify_tags ?? true]);
-  res.json({ success: true });
-});
-
-// Owner: ver e controlar notificações de um viewer específico (usuário que ela criou)
-app.get("/api/users/:id/notification-settings", requireAuth, async (req, res) => {
-  if (req.user.role !== "owner") return res.status(403).json({ error: "Sem permissão" });
-  const viewerId = Number(req.params.id);
-  const owns = await query("SELECT id FROM users WHERE id=$1 AND owner_id=$2", [viewerId, req.user.id]);
-  if (!owns.rows[0]) return res.status(403).json({ error: "Este usuário não é seu" });
-  const r = await query("SELECT * FROM notification_settings WHERE user_id=$1", [viewerId]);
-  res.json(r.rows[0] || { notify_midnight: true, notify_hours_before: 0, notify_tags: true });
-});
-
-app.put("/api/users/:id/notification-settings", requireAuth, async (req, res) => {
-  if (req.user.role !== "owner") return res.status(403).json({ error: "Sem permissão" });
-  const viewerId = Number(req.params.id);
-  const owns = await query("SELECT id FROM users WHERE id=$1 AND owner_id=$2", [viewerId, req.user.id]);
-  if (!owns.rows[0]) return res.status(403).json({ error: "Este usuário não é seu" });
-  const { notify_midnight, notify_hours_before, notify_tags } = req.body;
-  await query(`
-    INSERT INTO notification_settings (user_id, notify_midnight, notify_hours_before, notify_tags)
-    VALUES ($1,$2,$3,$4)
-    ON CONFLICT (user_id) DO UPDATE SET
-      notify_midnight=$2, notify_hours_before=$3, notify_tags=$4
-  `, [viewerId, notify_midnight ?? true, notify_hours_before ?? 0, notify_tags ?? true]);
   res.json({ success: true });
 });
 

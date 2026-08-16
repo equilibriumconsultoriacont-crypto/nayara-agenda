@@ -74,7 +74,7 @@ export default function Tags({ user }) {
       )}
 
       {/* Add form */}
-      {user.role === 'owner' && (
+      {user.isOwner && (
         <div style={{
           background:'rgba(30,16,53,0.8)',borderRadius:16,
           border:'1px solid rgba(109,40,217,0.3)',padding:20,

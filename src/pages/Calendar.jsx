@@ -13,7 +13,18 @@ const TYPE_CONFIG = {
   off:     { emoji: '🌙', label: 'Folga',     bg: 'rgba(251,191,36,0.15)', border: 'rgba(251,191,36,0.4)', color: '#fde68a' },
 };
 
-export default function Calendar({ user }) {
+// Config visual de um turno, aplicando a cor personalizada (opcional) por cima do tipo.
+function shiftCfg(shift) {
+  if (!shift) return null;
+  const base = TYPE_CONFIG[shift.type] || TYPE_CONFIG.work;
+  if (!shift.color) return base;
+  return {
+    emoji: base.emoji, label: base.label, color: shift.color,
+    bg: shift.color + '22', border: shift.color + '66',
+  };
+}
+
+export default function Calendar({ user, ownerId, canEdit, viewingName }) {
   const now = new Date();
   const [year, setYear] = useState(now.getFullYear());
   const [month, setMonth] = useState(now.getMonth() + 1);
@@ -22,19 +33,26 @@ export default function Calendar({ user }) {
   const [selected, setSelected] = useState(null);
   const [detailOpen, setDetailOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
+  const [presets, setPresets] = useState([]);
 
   const loadShifts = useCallback(async () => {
     try {
-      const r = await fetch(`/api/shifts/${year}/${month}`);
+      const r = await fetch(`/api/shifts/${year}/${month}?owner=${ownerId}`);
       const data = await r.json();
       const map = {};
-      data.shifts.forEach(s => { map[s.date] = s; });
+      (data.shifts || []).forEach(s => { map[s.date] = s; });
       setShifts(map);
       setTagsByDate(data.tagsByDate || {});
     } catch {}
-  }, [year, month]);
+  }, [year, month, ownerId]);
 
   useEffect(() => { loadShifts(); }, [loadShifts]);
+
+  // Horários padrões (só quando é a agenda da própria pessoa, p/ usar no editor).
+  useEffect(() => {
+    if (!canEdit) { setPresets([]); return; }
+    fetch('/api/presets').then(r => r.ok ? r.json() : []).then(setPresets).catch(() => {});
+  }, [canEdit]);
 
   useEffect(() => {
     // Tenta ativar push silenciosamente (se já tiver permissão concedida).
@@ -68,6 +86,13 @@ export default function Calendar({ user }) {
 
   return (
     <div style={{padding:'0 0 80px',maxWidth:500,margin:'0 auto'}}>
+      {viewingName && (
+        <div style={{
+          margin:'12px 16px 0',padding:'8px 12px',borderRadius:10,textAlign:'center',
+          background:'rgba(96,165,250,0.1)',border:'1px solid rgba(96,165,250,0.3)',
+          color:'#93c5fd',fontSize:12,
+        }}>👁️ Você está vendo a agenda de <strong>{viewingName}</strong> (somente leitura)</div>
+      )}
       {/* Navigator */}
       <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'16px 16px 8px',gap:8}}>
         <button onClick={prevMonth} style={{background:'rgba(109,40,217,0.2)',border:'1px solid rgba(109,40,217,0.3)',color:'#c4b5fd',borderRadius:10,padding:'8px 14px',fontSize:18}}>‹</button>
@@ -108,7 +133,7 @@ export default function Calendar({ user }) {
             const shift=shifts[dateStr];
             const dayTags=tagsByDate[dateStr]||[];
             const isToday=dateStr===todayStr;
-            const cfg=shift?TYPE_CONFIG[shift.type]:null;
+            const cfg=shiftCfg(shift);
             const isSun=idx%7===0, isSat=idx%7===6;
             return (
               <div key={idx} onClick={()=>handleDayClick(day)}
@@ -151,23 +176,25 @@ export default function Calendar({ user }) {
         ))}
       </div>
 
-      {/* Detail modal — for ALL users */}
+      {/* Detail modal — todos os usuários (edição só quando é a própria agenda) */}
       {detailOpen && selected && (
         <DayDetail
           date={selected}
           user={user}
+          ownerId={ownerId}
+          canEdit={canEdit}
           onClose={()=>setDetailOpen(false)}
           onEdit={()=>{setDetailOpen(false);setEditOpen(true);}}
           onRefresh={loadShifts}
         />
       )}
 
-      {/* Edit modal — only for owner */}
-      {editOpen && selected && (
+      {/* Edit modal — só na própria agenda */}
+      {editOpen && selected && canEdit && (
         <ShiftModal
           date={selected}
           shift={shifts[selected]||null}
-          existingTags={tagsByDate[selected]||[]}
+          presets={presets}
           onSave={async(date,data)=>{
             await fetch(`/api/shifts/${date}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
             await loadShifts();

@@ -3,31 +3,35 @@ import { useState } from 'react';
 const MONTHS_PT = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho',
   'Julho','Agosto','Setembro','Outubro','Novembro','Dezembro'];
 
-export default function ShiftModal({ date, shift, onSave, onDelete, onClose }) {
+const COLORS = ['#22c55e','#3b82f6','#a855f7','#f59e0b','#ef4444','#ec4899','#14b8a6','#eab308','#6d28d9'];
+
+export default function ShiftModal({ date, shift, presets = [], onSave, onDelete, onClose }) {
   const [type, setType] = useState(shift?.type || 'work');
   const [startTime, setStartTime] = useState(shift?.start_time || '07:00');
   const [endTime, setEndTime] = useState(shift?.end_time || '13:00');
   const [hours, setHours] = useState(shift?.hours || 6);
   const [notes, setNotes] = useState(shift?.notes || '');
+  const [color, setColor] = useState(shift?.color || '');
   const [saving, setSaving] = useState(false);
 
   const [y, m, d] = date.split('-');
   const dayOfWeek = new Date(date + 'T12:00:00').toLocaleDateString('pt-BR', { weekday: 'long' });
   const label = `${d} de ${MONTHS_PT[Number(m)-1]}, ${y}`;
 
-  // Preset quick buttons
-  const presets = [
-    { label: '6h manhã', type: 'work', start: '07:00', end: '13:00', hours: 6 },
-    { label: '6h tarde', type: 'work', start: '13:00', end: '19:00', hours: 6 },
-    { label: '6h noite', type: 'work', start: '19:00', end: '01:00', hours: 6 },
-    { label: '12h dia', type: 'plantao', start: '07:00', end: '19:00', hours: 12 },
-    { label: '12h noite', type: 'plantao', start: '19:00', end: '07:00', hours: 12 },
-    { label: 'Folga', type: 'off', start: '', end: '', hours: 0 },
-  ];
+  // Horários padrões cadastrados pela pessoa (com cor). Se não tiver nenhum, usa uns genéricos.
+  const myPresets = presets.length > 0
+    ? presets.map(p => ({ label: p.label, type: p.type, start: p.start_time || '', end: p.end_time || '', hours: p.hours || 0, color: p.color || '' }))
+    : [
+        { label: '6h manhã', type: 'work', start: '07:00', end: '13:00', hours: 6, color: '' },
+        { label: '6h tarde', type: 'work', start: '13:00', end: '19:00', hours: 6, color: '' },
+        { label: '12h dia', type: 'plantao', start: '07:00', end: '19:00', hours: 12, color: '' },
+        { label: '12h noite', type: 'plantao', start: '19:00', end: '07:00', hours: 12, color: '' },
+        { label: 'Folga', type: 'off', start: '', end: '', hours: 0, color: '' },
+      ];
 
   const applyPreset = (p) => {
     setType(p.type); setStartTime(p.start);
-    setEndTime(p.end); setHours(p.hours);
+    setEndTime(p.end); setHours(p.hours); setColor(p.color || '');
   };
 
   const handleSave = async () => {
@@ -38,6 +42,7 @@ export default function ShiftModal({ date, shift, onSave, onDelete, onClose }) {
       endTime: type === 'off' ? null : endTime || null,
       hours: type === 'off' ? 0 : hours || null,
       notes: notes || null,
+      color: type === 'off' ? null : (color || null),
     });
     setSaving(false);
     onClose();
@@ -72,17 +77,18 @@ export default function ShiftModal({ date, shift, onSave, onDelete, onClose }) {
           <p style={{ fontSize: 14, color: '#a78bfa' }}>{label}</p>
         </div>
 
-        {/* Quick presets */}
-        <p style={{ fontSize: 12, color: '#7c3aed', marginBottom: 8, fontWeight: 600 }}>ATALHOS RÁPIDOS</p>
+        {/* Meus horários (presets) */}
+        <p style={{ fontSize: 12, color: '#7c3aed', marginBottom: 8, fontWeight: 600 }}>MEUS HORÁRIOS</p>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 6, marginBottom: 20 }}>
-          {presets.map(p => (
-            <button key={p.label} onClick={() => applyPreset(p)} style={{
+          {myPresets.map((p, i) => (
+            <button key={p.label + i} onClick={() => applyPreset(p)} style={{
               padding: '10px 6px', borderRadius: 10, fontSize: 12, fontWeight: 600,
-              background: type === p.type && (p.hours === hours || p.type === 'off')
-                ? 'rgba(109,40,217,0.4)' : 'rgba(109,40,217,0.1)',
-              border: '1px solid rgba(109,40,217,0.3)', color: '#c4b5fd',
+              background: 'rgba(109,40,217,0.12)',
+              border: `1px solid ${p.color || 'rgba(109,40,217,0.3)'}`,
+              borderLeft: `4px solid ${p.color || 'rgba(109,40,217,0.5)'}`,
+              color: '#c4b5fd', textAlign: 'left',
             }}>
-              {p.type === 'off' ? '🌙' : p.hours === 12 ? '🏥' : '💼'} {p.label}
+              {p.type === 'off' ? '🌙' : p.type === 'plantao' ? '🏥' : '💼'} {p.label}
             </button>
           ))}
         </div>
@@ -137,6 +143,26 @@ export default function ShiftModal({ date, shift, onSave, onDelete, onClose }) {
                   {[4,6,8,10,12].map(h => <option key={h} value={h}>{h}h</option>)}
                 </select>
               </div>
+            </div>
+          </>
+        )}
+
+        {/* Cor (opcional) */}
+        {type !== 'off' && (
+          <>
+            <p style={{ fontSize: 12, color: '#7c3aed', marginBottom: 8, fontWeight: 600 }}>COR (OPCIONAL)</p>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 20, alignItems: 'center' }}>
+              <button type="button" onClick={() => setColor('')} style={{
+                padding: '6px 10px', borderRadius: 8, fontSize: 12, fontWeight: 600,
+                background: color ? 'rgba(109,40,217,0.1)' : 'rgba(109,40,217,0.4)',
+                border: '1px solid rgba(109,40,217,0.3)', color: '#c4b5fd',
+              }}>Sem cor</button>
+              {COLORS.map(c => (
+                <button key={c} type="button" onClick={() => setColor(c)} style={{
+                  width: 30, height: 30, borderRadius: '50%', background: c, border: 'none', cursor: 'pointer',
+                  outline: color === c ? '3px solid #fff' : '3px solid transparent', outlineOffset: 2,
+                }} />
+              ))}
             </div>
           </>
         )}

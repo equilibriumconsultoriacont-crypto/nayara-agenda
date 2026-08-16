@@ -107,7 +107,7 @@ export default function Settings({ user }) {
           }}>{busy==='test' ? 'Enviando...' : '📲 Testar agora'}</button>
         </div>
 
-        {user.role === 'owner' && (
+        {user.isOwner && (
           <button onClick={handleSendToday} disabled={busy==='today'} style={{
             width: '100%', marginTop: 8, padding: '11px', borderRadius: 10,
             border: '1px solid rgba(109,40,217,0.3)', background: 'rgba(109,40,217,0.08)',

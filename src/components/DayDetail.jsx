@@ -8,7 +8,7 @@ const TYPE_CONFIG = {
   off:     { emoji: '🌙', label: 'Folga',     color: '#fde68a', bg: 'rgba(251,191,36,0.15)', border: 'rgba(251,191,36,0.3)' },
 };
 
-export default function DayDetail({ date, user, onClose, onEdit, onRefresh }) {
+export default function DayDetail({ date, user, ownerId, canEdit, onClose, onEdit, onRefresh }) {
   const [shift, setShift] = useState(null);
   const [tags, setTags] = useState([]);
   const [allTags, setAllTags] = useState([]);
@@ -25,17 +25,17 @@ export default function DayDetail({ date, user, onClose, onEdit, onRefresh }) {
   async function load() {
     setLoading(true);
     try {
-      const r = await fetch(`/api/shifts/${date}/detail`);
+      const r = await fetch(`/api/shifts/${date}/detail?owner=${ownerId}`);
       if (!r.ok) throw new Error('http ' + r.status);
       const data = await r.json();
       setShift(data.shift || null);
       setTags(data.tags || []);
       setLoadError(false);
     } catch { setLoadError(true); }
-    // Owner: carrega todas as tags (para adicionar) e a lista de pessoas liberadas (responsáveis).
-    if (user.role === 'owner') {
+    // Só na própria agenda: carrega tags disponíveis e pessoas liberadas (responsáveis).
+    if (canEdit) {
       try {
-        const r2 = await fetch('/api/tags');
+        const r2 = await fetch(`/api/tags?owner=${ownerId}`);
         if (r2.ok) setAllTags(await r2.json());
         const r3 = await fetch('/api/users');
         if (r3.ok) setViewers(await r3.json());
@@ -78,7 +78,10 @@ export default function DayDetail({ date, user, onClose, onEdit, onRefresh }) {
     onRefresh();
   }
 
-  const cfg = shift ? TYPE_CONFIG[shift.type] : null;
+  let cfg = shift ? TYPE_CONFIG[shift.type] : null;
+  if (shift && shift.color) {
+    cfg = { emoji: cfg.emoji, label: cfg.label, color: shift.color, bg: shift.color + '22', border: shift.color + '55' };
+  }
 
   return (
     <div style={{
@@ -119,7 +122,7 @@ export default function DayDetail({ date, user, onClose, onEdit, onRefresh }) {
               <div style={{textAlign:'center',padding:'24px 0'}}>
                 <p style={{fontSize:40,marginBottom:8}}>📋</p>
                 <p style={{color:'#a78bfa',fontSize:14}}>Nenhum turno registrado</p>
-                {user.role === 'owner' && (
+                {canEdit && (
                   <button onClick={onEdit} style={{
                     marginTop:16,padding:'10px 24px',borderRadius:10,border:'none',
                     background:'linear-gradient(135deg,#6d28d9,#a855f7)',color:'#fff',fontSize:14,fontWeight:600,
@@ -173,7 +176,7 @@ export default function DayDetail({ date, user, onClose, onEdit, onRefresh }) {
                     <ShiftTagRow
                       key={t.tag_id}
                       t={t}
-                      isOwner={user.role === 'owner'}
+                      isOwner={canEdit}
                       viewers={viewers}
                       onRemove={() => toggleTag({ id: t.tag_id })}
                       onSave={(patch) => updateShiftTag(t.tag_id, patch)}
@@ -184,7 +187,7 @@ export default function DayDetail({ date, user, onClose, onEdit, onRefresh }) {
             )}
 
             {/* Owner: add tags */}
-            {user.role === 'owner' && allTags.length > 0 && (
+            {canEdit && allTags.length > 0 && (
               <div style={{marginBottom:16}}>
                 <p style={{fontSize:12,color:'#7c3aed',fontWeight:600,marginBottom:8}}>ADICIONAR LEMBRETES</p>
                 <div style={{display:'flex',flexWrap:'wrap',gap:8}}>
@@ -203,7 +206,7 @@ export default function DayDetail({ date, user, onClose, onEdit, onRefresh }) {
             )}
 
             {/* Owner: edit + delete buttons */}
-            {user.role === 'owner' && shift && (
+            {canEdit && shift && (
               <div style={{display:'flex',gap:8,marginBottom:8}}>
                 <button onClick={onEdit} style={{
                   flex:1,padding:'13px',borderRadius:12,border:'none',
