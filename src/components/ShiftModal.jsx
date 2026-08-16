@@ -8,6 +8,7 @@ const COLORS = [
   '#ef4444','#f43f5e','#ec4899','#d946ef','#a855f7','#7c3aed',
   '#6366f1','#3b82f6','#0ea5e9','#06b6d4','#14b8a6','#64748b',
 ];
+const EMOJIS = ['💼','🏥','🌙','😴','🏖️','🛌','🌞','🌴','✈️','🏠','❤️','⭐','🎉','☕','🚑','💊','🩺','📚','🎓','🏃'];
 
 export default function ShiftModal({ date, shift, presets = [], onSave, onDelete, onClose }) {
   const [type, setType] = useState(shift?.type || 'work');
@@ -16,26 +17,27 @@ export default function ShiftModal({ date, shift, presets = [], onSave, onDelete
   const [hours, setHours] = useState(shift?.hours || 6);
   const [notes, setNotes] = useState(shift?.notes || '');
   const [color, setColor] = useState(shift?.color || '');
+  const [emoji, setEmoji] = useState(shift?.emoji || '');
   const [saving, setSaving] = useState(false);
 
   const [y, m, d] = date.split('-');
   const dayOfWeek = new Date(date + 'T12:00:00').toLocaleDateString('pt-BR', { weekday: 'long' });
   const label = `${d} de ${MONTHS_PT[Number(m)-1]}, ${y}`;
 
-  // Horários padrões cadastrados pela pessoa (com cor). Se não tiver nenhum, usa uns genéricos.
+  // Horários padrões cadastrados pela pessoa (com cor/emoji). Se não tiver, usa uns genéricos.
   const myPresets = presets.length > 0
-    ? presets.map(p => ({ label: p.label, type: p.type, start: p.start_time || '', end: p.end_time || '', hours: p.hours || 0, color: p.color || '' }))
+    ? presets.map(p => ({ label: p.label, type: p.type, start: p.start_time || '', end: p.end_time || '', hours: p.hours || 0, color: p.color || '', emoji: p.emoji || '' }))
     : [
-        { label: '6h manhã', type: 'work', start: '07:00', end: '13:00', hours: 6, color: '' },
-        { label: '6h tarde', type: 'work', start: '13:00', end: '19:00', hours: 6, color: '' },
-        { label: '12h dia', type: 'plantao', start: '07:00', end: '19:00', hours: 12, color: '' },
-        { label: '12h noite', type: 'plantao', start: '19:00', end: '07:00', hours: 12, color: '' },
-        { label: 'Folga', type: 'off', start: '', end: '', hours: 0, color: '' },
+        { label: '6h manhã', type: 'work', start: '07:00', end: '13:00', hours: 6, color: '', emoji: '' },
+        { label: '6h tarde', type: 'work', start: '13:00', end: '19:00', hours: 6, color: '', emoji: '' },
+        { label: '12h dia', type: 'plantao', start: '07:00', end: '19:00', hours: 12, color: '', emoji: '' },
+        { label: '12h noite', type: 'plantao', start: '19:00', end: '07:00', hours: 12, color: '', emoji: '' },
+        { label: 'Folga', type: 'off', start: '', end: '', hours: 0, color: '', emoji: '' },
       ];
 
   const applyPreset = (p) => {
     setType(p.type); setStartTime(p.start);
-    setEndTime(p.end); setHours(p.hours); setColor(p.color || '');
+    setEndTime(p.end); setHours(p.hours); setColor(p.color || ''); setEmoji(p.emoji || '');
   };
 
   const handleSave = async () => {
@@ -46,7 +48,8 @@ export default function ShiftModal({ date, shift, presets = [], onSave, onDelete
       endTime: type === 'off' ? null : endTime || null,
       hours: type === 'off' ? 0 : hours || null,
       notes: notes || null,
-      color: type === 'off' ? null : (color || null),
+      color: color || null,
+      emoji: emoji || null,
     });
     setSaving(false);
     onClose();
@@ -151,25 +154,38 @@ export default function ShiftModal({ date, shift, presets = [], onSave, onDelete
           </>
         )}
 
-        {/* Cor (opcional) */}
-        {type !== 'off' && (
-          <>
-            <p style={{ fontSize: 12, color: '#7c3aed', marginBottom: 8, fontWeight: 600 }}>COR (OPCIONAL)</p>
-            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 20, alignItems: 'center' }}>
-              <button type="button" onClick={() => setColor('')} style={{
-                padding: '6px 10px', borderRadius: 8, fontSize: 12, fontWeight: 600,
-                background: color ? 'rgba(109,40,217,0.1)' : 'rgba(109,40,217,0.4)',
-                border: '1px solid rgba(109,40,217,0.3)', color: '#c4b5fd',
-              }}>Sem cor</button>
-              {COLORS.map(c => (
-                <button key={c} type="button" onClick={() => setColor(c)} style={{
-                  width: 30, height: 30, borderRadius: '50%', background: c, border: 'none', cursor: 'pointer',
-                  outline: color === c ? '3px solid #fff' : '3px solid transparent', outlineOffset: 2,
-                }} />
-              ))}
-            </div>
-          </>
-        )}
+        {/* Emoji (opcional) — vale para qualquer tipo, inclusive Folga */}
+        <p style={{ fontSize: 12, color: '#7c3aed', marginBottom: 8, fontWeight: 600 }}>EMOJI (OPCIONAL)</p>
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 20, alignItems: 'center' }}>
+          <button type="button" onClick={() => setEmoji('')} style={{
+            padding: '6px 10px', borderRadius: 8, fontSize: 12, fontWeight: 600,
+            background: emoji ? 'rgba(109,40,217,0.1)' : 'rgba(109,40,217,0.4)',
+            border: '1px solid rgba(109,40,217,0.3)', color: '#c4b5fd',
+          }}>Padrão</button>
+          {EMOJIS.map(e => (
+            <button key={e} type="button" onClick={() => setEmoji(e)} style={{
+              fontSize: 20, padding: 5, borderRadius: 8, lineHeight: 1, cursor: 'pointer',
+              background: emoji === e ? 'rgba(109,40,217,0.45)' : 'rgba(109,40,217,0.1)',
+              border: `1px solid ${emoji === e ? '#7c3aed' : 'rgba(109,40,217,0.2)'}`,
+            }}>{e}</button>
+          ))}
+        </div>
+
+        {/* Cor (opcional) — vale para qualquer tipo, inclusive Folga */}
+        <p style={{ fontSize: 12, color: '#7c3aed', marginBottom: 8, fontWeight: 600 }}>COR (OPCIONAL)</p>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 20, alignItems: 'center' }}>
+          <button type="button" onClick={() => setColor('')} style={{
+            padding: '6px 10px', borderRadius: 8, fontSize: 12, fontWeight: 600,
+            background: color ? 'rgba(109,40,217,0.1)' : 'rgba(109,40,217,0.4)',
+            border: '1px solid rgba(109,40,217,0.3)', color: '#c4b5fd',
+          }}>Padrão</button>
+          {COLORS.map(c => (
+            <button key={c} type="button" onClick={() => setColor(c)} style={{
+              width: 30, height: 30, borderRadius: '50%', background: c, border: 'none', cursor: 'pointer',
+              outline: color === c ? '3px solid #fff' : '3px solid transparent', outlineOffset: 2,
+            }} />
+          ))}
+        </div>
 
         {/* Notes */}
         <p style={{ fontSize: 12, color: '#7c3aed', marginBottom: 8, fontWeight: 600 }}>OBSERVAÇÃO</p>

@@ -157,15 +157,31 @@ async function setupDB() {
     )
   `);
 
-  // Backfill: dias já lançados (sem cor) que batem com um horário padrão herdam a cor dele.
+  // Emoji personalizado por turno / horário padrão (opcional).
+  await query(`ALTER TABLE shifts ADD COLUMN IF NOT EXISTS emoji TEXT`);
+  await query(`ALTER TABLE shift_presets ADD COLUMN IF NOT EXISTS emoji TEXT`);
+
+  // Backfill: dias já lançados (sem cor/emoji) que batem com um horário padrão herdam dele.
+  // (a) turnos com horário → casa por início/fim.
   await query(`
-    UPDATE shifts s SET color = p.color
+    UPDATE shifts s
+    SET color = COALESCE(NULLIF(s.color, ''), p.color),
+        emoji = COALESCE(NULLIF(s.emoji, ''), p.emoji)
     FROM shift_presets p
-    WHERE s.owner_id = p.owner_id
-      AND s.start_time = p.start_time
-      AND s.end_time IS NOT DISTINCT FROM p.end_time
-      AND p.color IS NOT NULL
-      AND (s.color IS NULL OR s.color = '')
+    WHERE s.owner_id = p.owner_id AND p.type <> 'off'
+      AND s.start_time = p.start_time AND s.end_time IS NOT DISTINCT FROM p.end_time
+      AND (p.color IS NOT NULL OR p.emoji IS NOT NULL)
+      AND (s.color IS NULL OR s.color = '' OR s.emoji IS NULL OR s.emoji = '')
+  `);
+  // (b) folgas → casa por tipo 'off'.
+  await query(`
+    UPDATE shifts s
+    SET color = COALESCE(NULLIF(s.color, ''), p.color),
+        emoji = COALESCE(NULLIF(s.emoji, ''), p.emoji)
+    FROM shift_presets p
+    WHERE s.owner_id = p.owner_id AND p.type = 'off' AND s.type = 'off'
+      AND (p.color IS NOT NULL OR p.emoji IS NOT NULL)
+      AND (s.color IS NULL OR s.color = '' OR s.emoji IS NULL OR s.emoji = '')
   `);
 
   // Admin padrão (dona da 1ª agenda).
@@ -515,24 +531,50 @@ app.get("/api/presets", requireAuth, async (req, res) => {
   const r = await query("SELECT * FROM shift_presets WHERE owner_id=$1 ORDER BY start_time NULLS LAST, id", [req.user.id]);
   res.json(r.rows.map(p => ({ ...p, label: decField(p.label) })));
 });
+// Aplica cor/emoji de um horário padrão nos dias já lançados (sem cor/emoji) que batem com ele.
+async function applyPresetToShifts(ownerId, { type, startTime, endTime, color, emoji }) {
+  if (!color && !emoji) return;
+  if (type === "off") {
+    await query(`
+      UPDATE shifts SET color=COALESCE(NULLIF(color,''),$1), emoji=COALESCE(NULLIF(emoji,''),$2)
+      WHERE owner_id=$3 AND type='off' AND (color IS NULL OR color='' OR emoji IS NULL OR emoji='')
+    `, [color || null, emoji || null, ownerId]);
+  } else if (startTime) {
+    await query(`
+      UPDATE shifts SET color=COALESCE(NULLIF(color,''),$1), emoji=COALESCE(NULLIF(emoji,''),$2)
+      WHERE owner_id=$3 AND start_time=$4 AND end_time IS NOT DISTINCT FROM $5
+        AND (color IS NULL OR color='' OR emoji IS NULL OR emoji='')
+    `, [color || null, emoji || null, ownerId, startTime, endTime || null]);
+  }
+}
+
 app.post("/api/presets", requireAuth, async (req, res) => {
   if (!req.user.is_owner) return res.status(403).json({ error: "Ative sua agenda primeiro" });
-  const { label, type, startTime, endTime, hours, color } = req.body;
+  const { label, type, startTime, endTime, hours, color, emoji } = req.body;
   if (!label || !label.trim()) return res.status(400).json({ error: "Informe um nome" });
   const r = await query(
-    "INSERT INTO shift_presets (owner_id,label,type,start_time,end_time,hours,color) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *",
-    [req.user.id, encField(label.trim()), type || "work", startTime || null, endTime || null, hours || null, color || null]
+    "INSERT INTO shift_presets (owner_id,label,type,start_time,end_time,hours,color,emoji) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *",
+    [req.user.id, encField(label.trim()), type || "work", startTime || null, endTime || null, hours || null, color || null, emoji || null]
   );
-  // Aplica a cor deste horário padrão nos dias já lançados (sem cor) que batem com ele.
-  if (color && startTime) {
-    await query(`
-      UPDATE shifts SET color=$1
-      WHERE owner_id=$2 AND start_time=$3 AND end_time IS NOT DISTINCT FROM $4
-        AND (color IS NULL OR color='')
-    `, [color, req.user.id, startTime, endTime || null]);
-  }
+  await applyPresetToShifts(req.user.id, { type: type || "work", startTime, endTime, color, emoji });
   res.json({ ...r.rows[0], label: decField(r.rows[0].label) });
 });
+
+app.put("/api/presets/:id", requireAuth, async (req, res) => {
+  if (!req.user.is_owner) return res.status(403).json({ error: "Sem permissão" });
+  const { label, type, startTime, endTime, hours, color, emoji } = req.body;
+  if (!label || !label.trim()) return res.status(400).json({ error: "Informe um nome" });
+  const r = await query(
+    `UPDATE shift_presets SET label=$1,type=$2,start_time=$3,end_time=$4,hours=$5,color=$6,emoji=$7
+     WHERE id=$8 AND owner_id=$9 RETURNING *`,
+    [encField(label.trim()), type || "work", startTime || null, endTime || null, hours || null, color || null, emoji || null,
+     Number(req.params.id), req.user.id]
+  );
+  if (!r.rows[0]) return res.status(404).json({ error: "Horário não encontrado" });
+  await applyPresetToShifts(req.user.id, { type: type || "work", startTime, endTime, color, emoji });
+  res.json({ ...r.rows[0], label: decField(r.rows[0].label) });
+});
+
 app.delete("/api/presets/:id", requireAuth, async (req, res) => {
   await query("DELETE FROM shift_presets WHERE id=$1 AND owner_id=$2", [Number(req.params.id), req.user.id]);
   res.json({ success: true });
@@ -590,26 +632,34 @@ app.get("/api/shifts/:year/:month", requireAuth, async (req, res) => {
 app.put("/api/shifts/:date", requireAuth, async (req, res) => {
   if (!req.user.is_owner) return res.status(403).json({ error: "Sem permissão" });
   const { date } = req.params;
-  const { type, startTime, endTime, hours, notes, color } = req.body;
+  const { type, startTime, endTime, hours, notes, color, emoji } = req.body;
 
-  // Sem cor escolhida? Herda a cor de um horário padrão com o mesmo horário (se houver).
+  // Sem cor/emoji escolhidos? Herda de um horário padrão que bata (por horário; folga por tipo).
   let finalColor = color || null;
-  if (!finalColor && type !== "off" && startTime) {
-    const pr = await query(
-      `SELECT color FROM shift_presets
-       WHERE owner_id=$1 AND start_time=$2 AND end_time IS NOT DISTINCT FROM $3 AND color IS NOT NULL
-       ORDER BY id LIMIT 1`,
-      [req.user.id, startTime, endTime || null]
-    );
-    if (pr.rows[0]) finalColor = pr.rows[0].color;
+  let finalEmoji = emoji || null;
+  if (!finalColor || !finalEmoji) {
+    let pr = null;
+    if (type === "off") {
+      pr = await query("SELECT color, emoji FROM shift_presets WHERE owner_id=$1 AND type='off' ORDER BY id LIMIT 1", [req.user.id]);
+    } else if (startTime) {
+      pr = await query(
+        `SELECT color, emoji FROM shift_presets
+         WHERE owner_id=$1 AND start_time=$2 AND end_time IS NOT DISTINCT FROM $3 ORDER BY id LIMIT 1`,
+        [req.user.id, startTime, endTime || null]
+      );
+    }
+    if (pr && pr.rows[0]) {
+      if (!finalColor) finalColor = pr.rows[0].color || null;
+      if (!finalEmoji) finalEmoji = pr.rows[0].emoji || null;
+    }
   }
 
   await query(`
-    INSERT INTO shifts (owner_id,date,type,start_time,end_time,hours,notes,color)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+    INSERT INTO shifts (owner_id,date,type,start_time,end_time,hours,notes,color,emoji)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
     ON CONFLICT (owner_id,date) DO UPDATE SET
-      type=$3,start_time=$4,end_time=$5,hours=$6,notes=$7,color=$8,updated_at=NOW()
-  `, [req.user.id, date, type, startTime || null, endTime || null, hours || null, encField(notes || null), finalColor]);
+      type=$3,start_time=$4,end_time=$5,hours=$6,notes=$7,color=$8,emoji=$9,updated_at=NOW()
+  `, [req.user.id, date, type, startTime || null, endTime || null, hours || null, encField(notes || null), finalColor, finalEmoji]);
   const r = await query("SELECT * FROM shifts WHERE owner_id=$1 AND date=$2", [req.user.id, date]);
   res.json(outShift(r.rows[0]));
 });

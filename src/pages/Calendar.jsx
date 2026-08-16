@@ -13,14 +13,16 @@ const TYPE_CONFIG = {
   off:     { emoji: '🌙', label: 'Folga',     bg: 'rgba(251,191,36,0.15)', border: 'rgba(251,191,36,0.4)', color: '#fde68a' },
 };
 
-// Config visual de um turno, aplicando a cor personalizada (opcional) por cima do tipo.
+// Config visual de um turno, aplicando cor e emoji personalizados (opcionais) por cima do tipo.
 function shiftCfg(shift) {
   if (!shift) return null;
   const base = TYPE_CONFIG[shift.type] || TYPE_CONFIG.work;
-  if (!shift.color) return base;
   return {
-    emoji: base.emoji, label: base.label, color: shift.color,
-    bg: shift.color + '22', border: shift.color + '66',
+    emoji: shift.emoji || base.emoji,
+    label: base.label,
+    color: shift.color || base.color,
+    bg: shift.color ? shift.color + '22' : base.bg,
+    border: shift.color ? shift.color + '66' : base.border,
   };
 }
 

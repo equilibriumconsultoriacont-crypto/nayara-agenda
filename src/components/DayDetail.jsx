@@ -79,8 +79,14 @@ export default function DayDetail({ date, user, ownerId, canEdit, onClose, onEdi
   }
 
   let cfg = shift ? TYPE_CONFIG[shift.type] : null;
-  if (shift && shift.color) {
-    cfg = { emoji: cfg.emoji, label: cfg.label, color: shift.color, bg: shift.color + '22', border: shift.color + '55' };
+  if (shift) {
+    cfg = {
+      emoji: shift.emoji || cfg.emoji,
+      label: cfg.label,
+      color: shift.color || cfg.color,
+      bg: shift.color ? shift.color + '22' : cfg.bg,
+      border: shift.color ? shift.color + '55' : cfg.border,
+    };
   }
 
   return (
