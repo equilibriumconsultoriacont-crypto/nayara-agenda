@@ -5,7 +5,11 @@ const TYPES = [
   { v: 'plantao', e: '🏥', l: 'Plantão' },
   { v: 'off', e: '🌙', l: 'Folga' },
 ];
-const COLORS = ['#22c55e','#3b82f6','#a855f7','#f59e0b','#ef4444','#ec4899','#14b8a6','#eab308','#6d28d9'];
+const COLORS = [
+  '#22c55e','#16a34a','#84cc16','#eab308','#f59e0b','#f97316',
+  '#ef4444','#f43f5e','#ec4899','#d946ef','#a855f7','#7c3aed',
+  '#6366f1','#3b82f6','#0ea5e9','#06b6d4','#14b8a6','#64748b',
+];
 
 function calcHours(start, end) {
   if (!start || !end) return null;

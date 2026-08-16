@@ -156,6 +156,17 @@ async function setupDB() {
     )
   `);
 
+  // Backfill: dias já lançados (sem cor) que batem com um horário padrão herdam a cor dele.
+  await query(`
+    UPDATE shifts s SET color = p.color
+    FROM shift_presets p
+    WHERE s.owner_id = p.owner_id
+      AND s.start_time = p.start_time
+      AND s.end_time IS NOT DISTINCT FROM p.end_time
+      AND p.color IS NOT NULL
+      AND (s.color IS NULL OR s.color = '')
+  `);
+
   // Admin padrão (dona da 1ª agenda).
   const existing = await query("SELECT id FROM users WHERE email = $1", ["nayara.hummel@icloud.com"]);
   if (existing.rows.length === 0) {
@@ -497,6 +508,14 @@ app.post("/api/presets", requireAuth, async (req, res) => {
     "INSERT INTO shift_presets (owner_id,label,type,start_time,end_time,hours,color) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *",
     [req.user.id, label.trim(), type || "work", startTime || null, endTime || null, hours || null, color || null]
   );
+  // Aplica a cor deste horário padrão nos dias já lançados (sem cor) que batem com ele.
+  if (color && startTime) {
+    await query(`
+      UPDATE shifts SET color=$1
+      WHERE owner_id=$2 AND start_time=$3 AND end_time IS NOT DISTINCT FROM $4
+        AND (color IS NULL OR color='')
+    `, [color, req.user.id, startTime, endTime || null]);
+  }
   res.json(r.rows[0]);
 });
 app.delete("/api/presets/:id", requireAuth, async (req, res) => {
@@ -556,12 +575,25 @@ app.put("/api/shifts/:date", requireAuth, async (req, res) => {
   if (!req.user.is_owner) return res.status(403).json({ error: "Sem permissão" });
   const { date } = req.params;
   const { type, startTime, endTime, hours, notes, color } = req.body;
+
+  // Sem cor escolhida? Herda a cor de um horário padrão com o mesmo horário (se houver).
+  let finalColor = color || null;
+  if (!finalColor && type !== "off" && startTime) {
+    const pr = await query(
+      `SELECT color FROM shift_presets
+       WHERE owner_id=$1 AND start_time=$2 AND end_time IS NOT DISTINCT FROM $3 AND color IS NOT NULL
+       ORDER BY id LIMIT 1`,
+      [req.user.id, startTime, endTime || null]
+    );
+    if (pr.rows[0]) finalColor = pr.rows[0].color;
+  }
+
   await query(`
     INSERT INTO shifts (owner_id,date,type,start_time,end_time,hours,notes,color)
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
     ON CONFLICT (owner_id,date) DO UPDATE SET
       type=$3,start_time=$4,end_time=$5,hours=$6,notes=$7,color=$8,updated_at=NOW()
-  `, [req.user.id, date, type, startTime || null, endTime || null, hours || null, notes || null, color || null]);
+  `, [req.user.id, date, type, startTime || null, endTime || null, hours || null, notes || null, finalColor]);
   const r = await query("SELECT * FROM shifts WHERE owner_id=$1 AND date=$2", [req.user.id, date]);
   res.json(r.rows[0]);
 });
