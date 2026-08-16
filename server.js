@@ -766,6 +766,17 @@ app.post("/api/tags", requireAuth, async (req, res) => {
   );
   res.json({ ...r.rows[0], name: decField(r.rows[0].name) });
 });
+app.put("/api/tags/:id", requireAuth, async (req, res) => {
+  if (!req.user.is_owner) return res.status(403).json({ error: "Sem permissão" });
+  const { name, color, emoji } = req.body;
+  if (!name) return res.status(400).json({ error: "Nome obrigatório" });
+  const r = await query(
+    "UPDATE tags SET name=$1, color=$2, emoji=$3 WHERE id=$4 AND owner_id=$5 RETURNING *",
+    [encField(name), color || "#6d28d9", emoji || "🏷️", Number(req.params.id), req.user.id]
+  );
+  if (!r.rows[0]) return res.status(404).json({ error: "Lembrete não encontrado" });
+  res.json({ ...r.rows[0], name: decField(r.rows[0].name) });
+});
 app.delete("/api/tags/:id", requireAuth, async (req, res) => {
   if (!req.user.is_owner) return res.status(403).json({ error: "Sem permissão" });
   await query("DELETE FROM shift_tags WHERE tag_id=$1 AND owner_id=$2", [Number(req.params.id), req.user.id]);

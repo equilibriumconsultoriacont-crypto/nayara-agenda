@@ -11,9 +11,12 @@ const COLORS = [
   '#6366f1','#3b82f6','#0ea5e9','#06b6d4','#14b8a6','#64748b',
 ];
 
+const EMPTY = { name: '', emoji: '🏷️', color: '#6d28d9' };
+
 export default function Tags({ user }) {
   const [tags, setTags] = useState([]);
-  const [form, setForm] = useState({ name: '', emoji: '🏷️', color: '#6d28d9' });
+  const [form, setForm] = useState(EMPTY);
+  const [editingId, setEditingId] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -24,17 +27,26 @@ export default function Tags({ user }) {
 
   useEffect(() => { load(); }, []);
 
-  const handleAdd = async (e) => {
+  const resetForm = () => { setForm(EMPTY); setEditingId(null); setError(''); };
+
+  const startEdit = (t) => {
+    setEditingId(t.id);
+    setForm({ name: t.name || '', emoji: t.emoji || '🏷️', color: t.color || '#6d28d9' });
+    setError('');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const handleSubmit = async (e) => {
     e.preventDefault();
     setError(''); setLoading(true);
-    const r = await fetch('/api/tags', {
-      method: 'POST',
+    const r = await fetch(editingId ? `/api/tags/${editingId}` : '/api/tags', {
+      method: editingId ? 'PUT' : 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(form),
     });
     const data = await r.json();
     if (!r.ok) { setError(data.error); setLoading(false); return; }
-    setForm({ name: '', emoji: '🏷️', color: '#6d28d9' });
+    resetForm();
     await load();
     setLoading(false);
   };
@@ -42,6 +54,7 @@ export default function Tags({ user }) {
   const handleDelete = async (id) => {
     if (!confirm('Remover esta tag? Será removida de todos os dias também.')) return;
     await fetch(`/api/tags/${id}`, { method: 'DELETE' });
+    if (editingId === id) resetForm();
     load();
   };
 
@@ -59,7 +72,8 @@ export default function Tags({ user }) {
             <div key={t.id} style={{
               display:'flex',alignItems:'center',justifyContent:'space-between',
               padding:'12px 14px',borderRadius:12,marginBottom:8,
-              background:'rgba(30,16,53,0.8)',border:`1px solid ${t.color}44`,
+              background: editingId === t.id ? 'rgba(109,40,217,0.25)' : 'rgba(30,16,53,0.8)',
+              border:`1px solid ${t.color}44`, borderLeft:`4px solid ${t.color}`,
             }}>
               <div style={{ display:'flex',alignItems:'center',gap:10 }}>
                 <span style={{ fontSize:24 }}>{t.emoji}</span>
@@ -68,10 +82,18 @@ export default function Tags({ user }) {
                   <div style={{ width:40,height:4,borderRadius:2,background:t.color,marginTop:3 }}/>
                 </div>
               </div>
-              <button onClick={() => handleDelete(t.id)} style={{
-                background:'rgba(239,68,68,0.15)',border:'1px solid rgba(239,68,68,0.3)',
-                color:'#f87171',borderRadius:8,padding:'6px 10px',fontSize:16,
-              }}>🗑️</button>
+              {user.isOwner && (
+                <div style={{ display:'flex',gap:6 }}>
+                  <button onClick={() => startEdit(t)} style={{
+                    background:'rgba(109,40,217,0.2)',border:'1px solid rgba(109,40,217,0.4)',
+                    color:'#c4b5fd',borderRadius:8,padding:'6px 10px',fontSize:13,fontWeight:600,
+                  }}>✏️ Editar</button>
+                  <button onClick={() => handleDelete(t.id)} style={{
+                    background:'rgba(239,68,68,0.15)',border:'1px solid rgba(239,68,68,0.3)',
+                    color:'#f87171',borderRadius:8,padding:'6px 10px',fontSize:16,
+                  }}>🗑️</button>
+                </div>
+              )}
             </div>
           ))}
         </div>
@@ -81,10 +103,10 @@ export default function Tags({ user }) {
       {user.isOwner && (
         <div style={{
           background:'rgba(30,16,53,0.8)',borderRadius:16,
-          border:'1px solid rgba(109,40,217,0.3)',padding:20,
+          border:`1px solid ${editingId ? '#7c3aed' : 'rgba(109,40,217,0.3)'}`,padding:20,
         }}>
-          <p style={{ fontSize:14,fontWeight:700,color:'#c4b5fd',marginBottom:16 }}>➕ Novo Lembrete</p>
-          <form onSubmit={handleAdd} style={{ display:'flex',flexDirection:'column',gap:14 }}>
+          <p style={{ fontSize:14,fontWeight:700,color:'#c4b5fd',marginBottom:16 }}>{editingId ? '✏️ Editar lembrete' : '➕ Novo Lembrete'}</p>
+          <form onSubmit={handleSubmit} style={{ display:'flex',flexDirection:'column',gap:14 }}>
             <div>
               <label style={{ fontSize:12,color:'#7c3aed',display:'block',marginBottom:6 }}>Nome *</label>
               <input value={form.name} onChange={e=>setForm({...form,name:e.target.value})}
@@ -132,13 +154,21 @@ export default function Tags({ user }) {
 
             {error && <p style={{color:'#f87171',fontSize:13}}>❌ {error}</p>}
 
-            <button type='submit' disabled={loading} style={{
-              padding:'12px',borderRadius:10,border:'none',
-              background:'linear-gradient(135deg,#6d28d9,#a855f7)',
-              color:'#fff',fontSize:15,fontWeight:700,
-            }}>
-              {loading ? 'Criando...' : 'Criar Lembrete'}
-            </button>
+            <div style={{ display:'flex',gap:8 }}>
+              {editingId && (
+                <button type='button' onClick={resetForm} style={{
+                  flex:1,padding:'12px',borderRadius:10,border:'1px solid rgba(109,40,217,0.3)',
+                  background:'rgba(109,40,217,0.1)',color:'#a78bfa',fontSize:15,fontWeight:600,
+                }}>Cancelar</button>
+              )}
+              <button type='submit' disabled={loading} style={{
+                flex:2,padding:'12px',borderRadius:10,border:'none',
+                background:'linear-gradient(135deg,#6d28d9,#a855f7)',
+                color:'#fff',fontSize:15,fontWeight:700,
+              }}>
+                {loading ? 'Salvando...' : editingId ? 'Salvar alterações' : 'Criar Lembrete'}
+              </button>
+            </div>
           </form>
         </div>
       )}
