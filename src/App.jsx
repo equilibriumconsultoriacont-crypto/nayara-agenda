@@ -1,6 +1,8 @@
 import { useState, useEffect, useMemo } from 'react';
 import Login from './pages/Login.jsx';
 import Register from './pages/Register.jsx';
+import DevLogin from './pages/DevLogin.jsx';
+import DevDashboard from './pages/DevDashboard.jsx';
 import Calendar from './pages/Calendar.jsx';
 import Invites from './pages/Invites.jsx';
 import Tags from './pages/Tags.jsx';
@@ -20,6 +22,7 @@ export default function App() {
     const m = window.location.pathname.match(/^\/convite\/(.+)$/);
     return m ? m[1] : null;
   }, []);
+  const isDevRoute = useMemo(() => window.location.pathname.startsWith('/dev'), []);
 
   useEffect(() => {
     fetch('/api/me').then(r => r.ok ? r.json() : null)
@@ -75,8 +78,12 @@ export default function App() {
     </div>
   );
 
-  // Sem login: se veio de um convite, mostra o cadastro; senão, o login.
+  // Conta de desenvolvedor → painel de controle (sem agenda).
+  if (user && user.isDev) return <DevDashboard user={user} onLogout={handleLogout} />;
+
+  // Sem login: rota /dev mostra o login do dev; convite mostra cadastro; senão, login normal.
   if (!user) {
+    if (isDevRoute) return <DevLogin onLogin={handleLoggedIn} />;
     if (inviteToken) return <Register token={inviteToken} onLogin={handleLoggedIn} />;
     return <Login onLogin={handleLoggedIn} />;
   }

@@ -3,7 +3,7 @@ import cookieParser from "cookie-parser";
 import bcrypt from "bcryptjs";
 import { SignJWT, jwtVerify } from "jose";
 import { randomBytes } from "crypto";
-import { encField, decField } from "./crypto.js";
+import { encField, decField, encryptionEnabled } from "./crypto.js";
 import pg from "pg";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
@@ -14,6 +14,7 @@ import webpush from "web-push";
 const { Pool } = pg;
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3000;
+const APP_VERSION = "1.1.0";
 const SECRET = new TextEncoder().encode(process.env.JWT_SECRET || "nayara-agenda-secret-2024");
 const COOKIE = "nayara_session";
 
@@ -113,6 +114,10 @@ async function setupDB() {
   await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_owner BOOLEAN DEFAULT false`);
   await query(`UPDATE users SET is_owner = true WHERE role = 'owner'`);
 
+  // Painel do desenvolvedor: conta dev + bloqueio de contas.
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_dev BOOLEAN DEFAULT false`);
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked BOOLEAN DEFAULT false`);
+
   // Acessos de agenda (quem vê a agenda de quem) — N:N.
   await query(`
     CREATE TABLE IF NOT EXISTS agenda_access (
@@ -192,6 +197,23 @@ async function setupDB() {
       [encField("Nayara"), "nayara.hummel@icloud.com", hash]);
     console.log("✅ Usuário Nayara criado!");
   }
+
+  // Conta de DESENVOLVEDOR (painel de controle). Login por USUÁRIO, não e-mail.
+  const DEV_USER = (process.env.DEV_USERNAME || "devnayara").trim().toLowerCase();
+  const DEV_PASS = process.env.DEV_PASSWORD || "Nay@Dev2026#ctrl";
+  const devEx = await query("SELECT id FROM users WHERE email=$1", [DEV_USER]);
+  if (devEx.rows.length === 0) {
+    await query("INSERT INTO users (name,email,password_hash,role,is_owner,is_dev) VALUES ($1,$2,$3,'dev',false,true)",
+      [encField("Desenvolvedor"), DEV_USER, bcrypt.hashSync(DEV_PASS, 10)]);
+    console.log("✅ Conta DEV criada!");
+  } else if (process.env.DEV_PASSWORD) {
+    // Permite rotacionar a senha via env var.
+    await query("UPDATE users SET password_hash=$1, is_dev=true, blocked=false WHERE email=$2",
+      [bcrypt.hashSync(DEV_PASS, 10), DEV_USER]);
+  } else {
+    await query("UPDATE users SET is_dev=true WHERE email=$1", [DEV_USER]);
+  }
+
   console.log("✅ Banco configurado!");
 }
 
@@ -396,6 +418,7 @@ async function requireAuth(req, res, next) {
   if (!userId) return res.status(401).json({ error: "Sessão inválida" });
   const r = await query("SELECT * FROM users WHERE id=$1", [userId]);
   if (!r.rows[0]) return res.status(401).json({ error: "Usuário não encontrado" });
+  if (r.rows[0].blocked) return res.status(403).json({ error: "Conta bloqueada" });
   req.user = r.rows[0];
   next();
 }
@@ -411,8 +434,14 @@ async function publicUser(u) {
   return {
     id: u.id, name: decField(u.name), email: u.email, role: u.role,
     ownerId: u.owner_id ?? null, isOwner: !!u.is_owner,
-    agendas: await listAgendas(u.id),
+    isDev: !!u.is_dev, blocked: !!u.blocked,
+    agendas: u.is_dev ? [] : await listAgendas(u.id),
   };
+}
+
+function requireDev(req, res, next) {
+  if (!req.user?.is_dev) return res.status(403).json({ error: "Acesso restrito" });
+  next();
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -433,8 +462,21 @@ app.post("/api/login", async (req, res) => {
   const user = r.rows[0];
   if (!user || !bcrypt.compareSync(password, user.password_hash))
     return res.status(401).json({ error: "Credenciais inválidas" });
+  if (user.blocked) return res.status(403).json({ error: "Conta bloqueada pelo administrador" });
   setSessionCookie(res, await signToken(user.id, !!remember), !!remember);
   res.json({ success: true, user: await publicUser(user) });
+});
+
+// Login do DESENVOLVEDOR (por usuário, não e-mail).
+app.post("/api/dev/login", async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) return res.status(400).json({ error: "Usuário e senha obrigatórios" });
+  const r = await query("SELECT * FROM users WHERE email=$1 AND is_dev=true", [String(username).trim().toLowerCase()]);
+  const u = r.rows[0];
+  if (!u || !bcrypt.compareSync(password, u.password_hash))
+    return res.status(401).json({ error: "Credenciais inválidas" });
+  setSessionCookie(res, await signToken(u.id, true), true);
+  res.json({ success: true, user: await publicUser(u) });
 });
 app.post("/api/logout", (req, res) => { res.clearCookie(COOKIE); res.json({ success: true }); });
 app.get("/api/me", requireAuth, async (req, res) => {
@@ -585,7 +627,7 @@ app.delete("/api/presets/:id", requireAuth, async (req, res) => {
 app.get("/api/shifts/:date/detail", requireAuth, async (req, res) => {
   try {
     const ownerId = Number(req.query.owner) || req.user.id;
-    if (!(await canViewAgenda(req.user.id, ownerId))) return res.status(403).json({ error: "Sem acesso" });
+    if (!req.user.is_dev && !(await canViewAgenda(req.user.id, ownerId))) return res.status(403).json({ error: "Sem acesso" });
     const { date } = req.params;
     const [shiftR, tagsR] = await Promise.all([
       query("SELECT * FROM shifts WHERE owner_id=$1 AND date=$2", [ownerId, date]),
@@ -607,7 +649,7 @@ app.get("/api/shifts/:date/detail", requireAuth, async (req, res) => {
 
 app.get("/api/shifts/:year/:month", requireAuth, async (req, res) => {
   const ownerId = Number(req.query.owner) || req.user.id;
-  if (!(await canViewAgenda(req.user.id, ownerId))) return res.status(403).json({ error: "Sem acesso" });
+  if (!req.user.is_dev && !(await canViewAgenda(req.user.id, ownerId))) return res.status(403).json({ error: "Sem acesso" });
   const prefix = `${req.params.year}-${String(req.params.month).padStart(2, "0")}`;
   const [shiftsR, tagsR] = await Promise.all([
     query("SELECT * FROM shifts WHERE owner_id=$1 AND date LIKE $2", [ownerId, `${prefix}%`]),
@@ -776,6 +818,58 @@ app.put("/api/notification-settings", requireAuth, async (req, res) => {
     ON CONFLICT (user_id) DO UPDATE SET
       notify_midnight=$2, notify_hours_before=$3, notify_tags=$4
   `, [req.user.id, notify_midnight ?? true, notify_hours_before ?? 0, notify_tags ?? true]);
+  res.json({ success: true });
+});
+
+// ── Painel do Desenvolvedor ───────────────────────────────────────────────────
+app.get("/api/dev/overview", requireAuth, requireDev, async (req, res) => {
+  try {
+    const [tot, own, conv, blk, guests, inv, invUsed, sh, push] = await Promise.all([
+      query("SELECT COUNT(*)::int c FROM users WHERE is_dev IS NOT TRUE"),
+      query("SELECT COUNT(*)::int c FROM users WHERE is_dev IS NOT TRUE AND is_owner=true"),
+      query("SELECT COUNT(*)::int c FROM users u WHERE is_dev IS NOT TRUE AND is_owner=true AND u.id IN (SELECT viewer_id FROM agenda_access)"),
+      query("SELECT COUNT(*)::int c FROM users WHERE is_dev IS NOT TRUE AND blocked=true"),
+      query("SELECT COUNT(*)::int c FROM agenda_access"),
+      query("SELECT COUNT(*)::int c FROM invites"),
+      query("SELECT COUNT(*)::int c FROM invites WHERE used_by IS NOT NULL"),
+      query("SELECT COUNT(*)::int c FROM shifts"),
+      query("SELECT COUNT(*)::int c FROM push_subscriptions"),
+    ]);
+    const usersR = await query(`
+      SELECT u.id, u.name, u.email, u.created_at, u.is_owner, u.blocked,
+        (SELECT COUNT(*)::int FROM agenda_access a WHERE a.owner_id=u.id) AS guests,
+        (SELECT COUNT(*)::int FROM agenda_access a JOIN users v ON v.id=a.viewer_id WHERE a.owner_id=u.id AND v.is_owner=true) AS guests_owners,
+        (SELECT COUNT(*)::int FROM invites i WHERE i.owner_id=u.id) AS invites_sent,
+        (SELECT COUNT(*)::int FROM invites i WHERE i.owner_id=u.id AND i.used_by IS NOT NULL) AS invites_used,
+        (SELECT COUNT(*)::int FROM shifts s WHERE s.owner_id=u.id) AS shifts,
+        (SELECT COUNT(*)::int FROM push_subscriptions ps WHERE ps.user_id=u.id) AS push_on,
+        (SELECT uo.name FROM agenda_access a JOIN users uo ON uo.id=a.owner_id WHERE a.viewer_id=u.id ORDER BY a.created_at LIMIT 1) AS invited_by
+      FROM users u WHERE u.is_dev IS NOT TRUE ORDER BY u.created_at DESC
+    `);
+    const users = usersR.rows.map(x => ({
+      id: x.id, name: decField(x.name), email: x.email, createdAt: x.created_at,
+      isOwner: x.is_owner, blocked: x.blocked, guests: x.guests, guestsOwners: x.guests_owners,
+      invitesSent: x.invites_sent, invitesUsed: x.invites_used, shifts: x.shifts,
+      pushOn: x.push_on > 0, invitedBy: decField(x.invited_by),
+    }));
+    res.json({
+      health: { dbOk: true, serverTime: new Date().toISOString(), version: APP_VERSION, node: process.version, encryption: encryptionEnabled() },
+      stats: {
+        totalUsers: tot.rows[0].c, owners: own.rows[0].c, conversions: conv.rows[0].c,
+        blocked: blk.rows[0].c, guests: guests.rows[0].c, invites: inv.rows[0].c,
+        invitesUsed: invUsed.rows[0].c, shifts: sh.rows[0].c, pushEnabled: push.rows[0].c,
+      },
+      users,
+    });
+  } catch (e) {
+    console.error("[dev/overview]", e?.message);
+    res.status(500).json({ error: "Erro ao carregar", health: { dbOk: false, serverTime: new Date().toISOString() } });
+  }
+});
+
+app.post("/api/dev/users/:id/block", requireAuth, requireDev, async (req, res) => {
+  const blocked = !!req.body.blocked;
+  await query("UPDATE users SET blocked=$1 WHERE id=$2 AND is_dev IS NOT TRUE", [blocked, Number(req.params.id)]);
   res.json({ success: true });
 });
 
