@@ -45,6 +45,11 @@ export default function App() {
     setUser(null); setPage('calendar'); setCurrentOwnerId(null);
   };
 
+  const stopImpersonate = async () => {
+    await fetch('/api/dev/stop-impersonate', { method: 'POST' });
+    window.location.href = '/dev';
+  };
+
   const handleLoggedIn = (u) => {
     // limpa a URL do convite, se veio de lá
     if (window.location.pathname !== '/') window.history.replaceState({}, '', '/');
@@ -106,6 +111,19 @@ export default function App() {
 
   return (
     <div style={{minHeight:'100vh',display:'flex',flexDirection:'column'}}>
+      {user.impersonating && (
+        <div style={{
+          background:'linear-gradient(135deg,#0ea5e9,#6366f1)',color:'#fff',
+          padding:'8px 14px',display:'flex',alignItems:'center',justifyContent:'space-between',
+          gap:8,fontSize:13,position:'sticky',top:0,zIndex:60,
+        }}>
+          <span>🛠️ Modo dev — você está vendo como <strong>{user.name}</strong></span>
+          <button onClick={stopImpersonate} style={{
+            background:'rgba(255,255,255,0.2)',border:'1px solid rgba(255,255,255,0.4)',
+            color:'#fff',borderRadius:8,padding:'5px 10px',fontSize:12,fontWeight:700,flexShrink:0,
+          }}>Voltar ao painel</button>
+        </div>
+      )}
       <header style={{
         background:'linear-gradient(135deg,#1e1035,#2d1b69)',
         borderBottom:'1px solid rgba(109,40,217,0.3)',

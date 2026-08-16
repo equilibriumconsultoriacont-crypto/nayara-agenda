@@ -14,7 +14,8 @@ import webpush from "web-push";
 const { Pool } = pg;
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3000;
-const APP_VERSION = "1.1.0";
+const APP_VERSION = "1.2.0";
+const cronStatus = { daily: null, minute: null }; // último disparo de cada cron
 const SECRET = new TextEncoder().encode(process.env.JWT_SECRET || "nayara-agenda-secret-2024");
 const COOKIE = "nayara_session";
 
@@ -117,6 +118,18 @@ async function setupDB() {
   // Painel do desenvolvedor: conta dev + bloqueio de contas.
   await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_dev BOOLEAN DEFAULT false`);
   await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked BOOLEAN DEFAULT false`);
+
+  // Log de auditoria (quem fez o quê e quando).
+  await query(`
+    CREATE TABLE IF NOT EXISTS dev_events (
+      id SERIAL PRIMARY KEY,
+      type TEXT NOT NULL,
+      actor TEXT,
+      target_user_id INTEGER,
+      detail TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
 
   // Acessos de agenda (quem vê a agenda de quem) — N:N.
   await query(`
@@ -341,6 +354,7 @@ async function sendNotificationsForDate(dateStr) {
 // ── Cron: 00:00 — resumo do dia ───────────────────────────────────────────────
 cron.schedule("0 0 * * *", async () => {
   console.log("[CRON 00:00] Resumo do dia...");
+  cronStatus.daily = new Date().toISOString();
   await sendNotificationsForDate(ymdBrasilia());
 }, { timezone: "America/Sao_Paulo" });
 
@@ -348,6 +362,7 @@ cron.schedule("0 0 * * *", async () => {
 // (a) "X horas antes" do INÍCIO do turno (ex.: turno 18:00 + "1h antes" → 17:00 do MESMO dia).
 // (b) lembrete de tag com responsável, 2h antes do horário da tag.
 cron.schedule("* * * * *", async () => {
+  cronStatus.minute = new Date().toISOString();
   const nowB = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Sao_Paulo" }));
   const nowMin = nowB.getHours() * 60 + nowB.getMinutes();
   const todayStr = ymdBrasilia();
@@ -401,25 +416,33 @@ function secondsUntilBrasiliaMidnight() {
   return secs <= 0 ? 24 * 3600 : secs;
 }
 
-async function signToken(userId, remember) {
-  const jwt = new SignJWT({ sub: String(userId) }).setProtectedHeader({ alg: "HS256" });
+async function signToken(userId, remember, imp) {
+  const jwt = new SignJWT({ sub: String(userId), ...(imp ? { imp: String(imp) } : {}) }).setProtectedHeader({ alg: "HS256" });
   if (remember) jwt.setExpirationTime("30d");
   else jwt.setExpirationTime(Math.floor(Date.now() / 1000) + secondsUntilBrasiliaMidnight());
   return jwt.sign(SECRET);
 }
+// Token com validade curta (usado na impersonação).
+async function signTokenSeconds(userId, seconds, imp) {
+  return new SignJWT({ sub: String(userId), ...(imp ? { imp: String(imp) } : {}) })
+    .setProtectedHeader({ alg: "HS256" })
+    .setExpirationTime(Math.floor(Date.now() / 1000) + seconds)
+    .sign(SECRET);
+}
 async function verifyToken(token) {
-  try { const { payload } = await jwtVerify(token, SECRET); return Number(payload.sub); }
+  try { const { payload } = await jwtVerify(token, SECRET); return payload; }
   catch { return null; }
 }
 async function requireAuth(req, res, next) {
   const token = req.cookies[COOKIE];
   if (!token) return res.status(401).json({ error: "Não autenticado" });
-  const userId = await verifyToken(token);
-  if (!userId) return res.status(401).json({ error: "Sessão inválida" });
-  const r = await query("SELECT * FROM users WHERE id=$1", [userId]);
+  const payload = await verifyToken(token);
+  if (!payload) return res.status(401).json({ error: "Sessão inválida" });
+  const r = await query("SELECT * FROM users WHERE id=$1", [Number(payload.sub)]);
   if (!r.rows[0]) return res.status(401).json({ error: "Usuário não encontrado" });
   if (r.rows[0].blocked) return res.status(403).json({ error: "Conta bloqueada" });
   req.user = r.rows[0];
+  req.impersonatorId = payload.imp ? Number(payload.imp) : null;
   next();
 }
 
@@ -442,6 +465,14 @@ async function publicUser(u) {
 function requireDev(req, res, next) {
   if (!req.user?.is_dev) return res.status(403).json({ error: "Acesso restrito" });
   next();
+}
+
+// Registra um evento de auditoria (best-effort).
+async function logEvent(type, { actor = "system", targetUserId = null, detail = null } = {}) {
+  try {
+    await query("INSERT INTO dev_events (type, actor, target_user_id, detail) VALUES ($1,$2,$3,$4)",
+      [type, String(actor), targetUserId, detail]);
+  } catch (e) { console.warn("[event]", e?.message); }
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -480,7 +511,9 @@ app.post("/api/dev/login", async (req, res) => {
 });
 app.post("/api/logout", (req, res) => { res.clearCookie(COOKIE); res.json({ success: true }); });
 app.get("/api/me", requireAuth, async (req, res) => {
-  res.json(await publicUser(req.user));
+  const u = await publicUser(req.user);
+  u.impersonating = !!req.impersonatorId;
+  res.json(u);
 });
 
 // Convite: dados públicos p/ a tela de cadastro
@@ -516,6 +549,7 @@ app.post("/api/register", async (req, res) => {
   const newUser = uR.rows[0];
   await query("INSERT INTO agenda_access (owner_id, viewer_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [inv.owner_id, newUser.id]);
   await query("UPDATE invites SET used_by=$1 WHERE id=$2", [newUser.id, inv.id]);
+  await logEvent("signup", { actor: newUser.id, targetUserId: newUser.id, detail: `${finalName} entrou por convite` });
   setSessionCookie(res, await signToken(newUser.id, false), false);
   res.json({ success: true, user: await publicUser(newUser) });
 });
@@ -523,6 +557,7 @@ app.post("/api/register", async (req, res) => {
 // "Criar minha agenda": um convidado vira dono da própria agenda (mantém os acessos que já tem).
 app.post("/api/agenda/activate", requireAuth, async (req, res) => {
   await query("UPDATE users SET is_owner=true WHERE id=$1", [req.user.id]);
+  await logEvent("became_owner", { actor: req.user.id, targetUserId: req.user.id, detail: `${decField(req.user.name)} criou a própria agenda` });
   const fresh = await query("SELECT * FROM users WHERE id=$1", [req.user.id]);
   res.json({ success: true, user: await publicUser(fresh.rows[0]) });
 });
@@ -534,6 +569,7 @@ app.post("/api/invites", requireAuth, async (req, res) => {
   if (!name || !name.trim()) return res.status(400).json({ error: "Informe um nome" });
   const token = randomBytes(16).toString("hex");
   await query("INSERT INTO invites (owner_id,name,token) VALUES ($1,$2,$3)", [req.user.id, encField(name.trim()), token]);
+  await logEvent("invite_created", { actor: req.user.id, targetUserId: req.user.id, detail: `convidou ${name.trim()}` });
   res.json({ token });
 });
 app.get("/api/invites", requireAuth, async (req, res) => {
@@ -824,7 +860,8 @@ app.put("/api/notification-settings", requireAuth, async (req, res) => {
 // ── Painel do Desenvolvedor ───────────────────────────────────────────────────
 app.get("/api/dev/overview", requireAuth, requireDev, async (req, res) => {
   try {
-    const [tot, own, conv, blk, guests, inv, invUsed, sh, push] = await Promise.all([
+    const t0 = Date.now();
+    const [tot, own, conv, blk, guests, inv, invUsed, sh, push, newWeek, activeWeek] = await Promise.all([
       query("SELECT COUNT(*)::int c FROM users WHERE is_dev IS NOT TRUE"),
       query("SELECT COUNT(*)::int c FROM users WHERE is_dev IS NOT TRUE AND is_owner=true"),
       query("SELECT COUNT(*)::int c FROM users u WHERE is_dev IS NOT TRUE AND is_owner=true AND u.id IN (SELECT viewer_id FROM agenda_access)"),
@@ -834,7 +871,11 @@ app.get("/api/dev/overview", requireAuth, requireDev, async (req, res) => {
       query("SELECT COUNT(*)::int c FROM invites WHERE used_by IS NOT NULL"),
       query("SELECT COUNT(*)::int c FROM shifts"),
       query("SELECT COUNT(*)::int c FROM push_subscriptions"),
+      query("SELECT COUNT(*)::int c FROM users WHERE is_dev IS NOT TRUE AND created_at > NOW() - INTERVAL '7 days'"),
+      query("SELECT COUNT(DISTINCT owner_id)::int c FROM shifts WHERE updated_at > NOW() - INTERVAL '7 days'"),
     ]);
+    const dbMs = Date.now() - t0;
+
     const usersR = await query(`
       SELECT u.id, u.name, u.email, u.created_at, u.is_owner, u.blocked,
         (SELECT COUNT(*)::int FROM agenda_access a WHERE a.owner_id=u.id) AS guests,
@@ -842,6 +883,7 @@ app.get("/api/dev/overview", requireAuth, requireDev, async (req, res) => {
         (SELECT COUNT(*)::int FROM invites i WHERE i.owner_id=u.id) AS invites_sent,
         (SELECT COUNT(*)::int FROM invites i WHERE i.owner_id=u.id AND i.used_by IS NOT NULL) AS invites_used,
         (SELECT COUNT(*)::int FROM shifts s WHERE s.owner_id=u.id) AS shifts,
+        (SELECT MAX(updated_at) FROM shifts s WHERE s.owner_id=u.id) AS last_activity,
         (SELECT COUNT(*)::int FROM push_subscriptions ps WHERE ps.user_id=u.id) AS push_on,
         (SELECT uo.name FROM agenda_access a JOIN users uo ON uo.id=a.owner_id WHERE a.viewer_id=u.id ORDER BY a.created_at LIMIT 1) AS invited_by
       FROM users u WHERE u.is_dev IS NOT TRUE ORDER BY u.created_at DESC
@@ -850,15 +892,40 @@ app.get("/api/dev/overview", requireAuth, requireDev, async (req, res) => {
       id: x.id, name: decField(x.name), email: x.email, createdAt: x.created_at,
       isOwner: x.is_owner, blocked: x.blocked, guests: x.guests, guestsOwners: x.guests_owners,
       invitesSent: x.invites_sent, invitesUsed: x.invites_used, shifts: x.shifts,
-      pushOn: x.push_on > 0, invitedBy: decField(x.invited_by),
+      lastActivity: x.last_activity, pushOn: x.push_on > 0, invitedBy: decField(x.invited_by),
     }));
+
+    const signupsR = await query(`
+      SELECT to_char(created_at AT TIME ZONE 'America/Sao_Paulo','YYYY-MM-DD') d, COUNT(*)::int c
+      FROM users WHERE is_dev IS NOT TRUE AND created_at > NOW() - INTERVAL '14 days'
+      GROUP BY d ORDER BY d
+    `);
+    const eventsR = await query(`
+      SELECT e.type, e.actor, e.detail, e.created_at, u.name AS target_name
+      FROM dev_events e LEFT JOIN users u ON u.id = e.target_user_id
+      ORDER BY e.created_at DESC LIMIT 25
+    `);
+    const mem = process.memoryUsage();
+
     res.json({
-      health: { dbOk: true, serverTime: new Date().toISOString(), version: APP_VERSION, node: process.version, encryption: encryptionEnabled() },
+      health: {
+        dbOk: true, dbMs, serverTime: new Date().toISOString(),
+        version: APP_VERSION, node: process.version,
+        uptimeSec: Math.round(process.uptime()),
+        memMb: Math.round(mem.rss / 1048576),
+        encryption: encryptionEnabled(),
+        vapidCustom: !!process.env.VAPID_PUBLIC_KEY,
+        jwtCustom: !!process.env.JWT_SECRET,
+        cron: cronStatus,
+      },
       stats: {
         totalUsers: tot.rows[0].c, owners: own.rows[0].c, conversions: conv.rows[0].c,
         blocked: blk.rows[0].c, guests: guests.rows[0].c, invites: inv.rows[0].c,
         invitesUsed: invUsed.rows[0].c, shifts: sh.rows[0].c, pushEnabled: push.rows[0].c,
+        newThisWeek: newWeek.rows[0].c, activeThisWeek: activeWeek.rows[0].c,
       },
+      signupsByDay: signupsR.rows.map(r => ({ day: r.d, count: r.c })),
+      events: eventsR.rows.map(e => ({ type: e.type, actor: e.actor, detail: e.detail, at: e.created_at, targetName: decField(e.target_name) })),
       users,
     });
   } catch (e) {
@@ -867,9 +934,104 @@ app.get("/api/dev/overview", requireAuth, requireDev, async (req, res) => {
   }
 });
 
+// Detalhe completo de um usuário
+app.get("/api/dev/users/:id", requireAuth, requireDev, async (req, res) => {
+  const id = Number(req.params.id);
+  const uR = await query("SELECT * FROM users WHERE id=$1", [id]);
+  const u = uR.rows[0];
+  if (!u) return res.status(404).json({ error: "Não encontrado" });
+  const [guests, invitesList, shiftsAgg, ns, pushR, views, invitedBy, lastShift] = await Promise.all([
+    query("SELECT u2.id, u2.name, u2.email, u2.is_owner FROM agenda_access a JOIN users u2 ON u2.id=a.viewer_id WHERE a.owner_id=$1", [id]),
+    query("SELECT id, name, token, used_by FROM invites WHERE owner_id=$1 ORDER BY created_at DESC", [id]),
+    query("SELECT type, COUNT(*)::int c FROM shifts WHERE owner_id=$1 GROUP BY type", [id]),
+    query("SELECT * FROM notification_settings WHERE user_id=$1", [id]),
+    query("SELECT COUNT(*)::int c FROM push_subscriptions WHERE user_id=$1", [id]),
+    query("SELECT uo.id, uo.name FROM agenda_access a JOIN users uo ON uo.id=a.owner_id WHERE a.viewer_id=$1", [id]),
+    query("SELECT uo.name FROM agenda_access a JOIN users uo ON uo.id=a.owner_id WHERE a.viewer_id=$1 ORDER BY a.created_at LIMIT 1", [id]),
+    query("SELECT MAX(updated_at) m FROM shifts WHERE owner_id=$1", [id]),
+  ]);
+  res.json({
+    id: u.id, name: decField(u.name), email: u.email, createdAt: u.created_at,
+    isOwner: u.is_owner, blocked: u.blocked,
+    guests: guests.rows.map(g => ({ id: g.id, name: decField(g.name), email: g.email, isOwner: g.is_owner })),
+    invites: invitesList.rows.map(i => ({ id: i.id, name: decField(i.name), token: i.token, used: !!i.used_by })),
+    shiftsByType: shiftsAgg.rows.reduce((o, r) => { o[r.type] = r.c; return o; }, {}),
+    notif: ns.rows[0] || null, pushOn: pushR.rows[0].c > 0,
+    views: views.rows.map(v => ({ id: v.id, name: decField(v.name) })),
+    invitedBy: decField(invitedBy.rows[0]?.name),
+    lastActivity: lastShift.rows[0]?.m || null,
+  });
+});
+
 app.post("/api/dev/users/:id/block", requireAuth, requireDev, async (req, res) => {
   const blocked = !!req.body.blocked;
-  await query("UPDATE users SET blocked=$1 WHERE id=$2 AND is_dev IS NOT TRUE", [blocked, Number(req.params.id)]);
+  const id = Number(req.params.id);
+  const r = await query("UPDATE users SET blocked=$1 WHERE id=$2 AND is_dev IS NOT TRUE RETURNING name", [blocked, id]);
+  if (r.rows[0]) await logEvent(blocked ? "blocked" : "unblocked", { actor: "dev", targetUserId: id, detail: decField(r.rows[0].name) });
+  res.json({ success: true });
+});
+
+// Exclusão definitiva (cascata)
+app.delete("/api/dev/users/:id", requireAuth, requireDev, async (req, res) => {
+  const id = Number(req.params.id);
+  const t = await query("SELECT is_dev, name FROM users WHERE id=$1", [id]);
+  if (!t.rows[0]) return res.status(404).json({ error: "Não encontrado" });
+  if (t.rows[0].is_dev) return res.status(403).json({ error: "Não dá para excluir a conta dev" });
+  await query("DELETE FROM shift_tags WHERE owner_id=$1", [id]);
+  await query("DELETE FROM shifts WHERE owner_id=$1", [id]);
+  await query("DELETE FROM tags WHERE owner_id=$1", [id]);
+  await query("DELETE FROM shift_presets WHERE owner_id=$1", [id]);
+  await query("DELETE FROM invites WHERE owner_id=$1", [id]);
+  await query("DELETE FROM agenda_access WHERE owner_id=$1 OR viewer_id=$1", [id]);
+  await query("DELETE FROM push_subscriptions WHERE user_id=$1", [id]);
+  await query("DELETE FROM notification_settings WHERE user_id=$1", [id]);
+  await query("DELETE FROM users WHERE id=$1", [id]);
+  await logEvent("user_deleted", { actor: "dev", detail: decField(t.rows[0].name) });
+  res.json({ success: true });
+});
+
+// Enviar notificação (broadcast p/ todos ou p/ um usuário)
+app.post("/api/dev/broadcast", requireAuth, requireDev, async (req, res) => {
+  const { title, body, userId } = req.body;
+  if (!title || !body) return res.status(400).json({ error: "Título e mensagem obrigatórios" });
+  let ids;
+  if (userId) ids = [Number(userId)];
+  else ids = (await query("SELECT user_id FROM push_subscriptions")).rows.map(x => x.user_id);
+  let sent = 0;
+  for (const uid of ids) if (await sendPushToUser(uid, title, body)) sent++;
+  await logEvent("broadcast", { actor: "dev", targetUserId: userId ? Number(userId) : null, detail: `"${title}" → ${sent}/${ids.length}` });
+  res.json({ success: true, sent, total: ids.length });
+});
+
+// Impersonação: entrar como um usuário (rastreável e temporária — 1h)
+app.post("/api/dev/impersonate/:id", requireAuth, requireDev, async (req, res) => {
+  const id = Number(req.params.id);
+  const t = await query("SELECT id, name FROM users WHERE id=$1 AND is_dev IS NOT TRUE", [id]);
+  if (!t.rows[0]) return res.status(404).json({ error: "Usuário não encontrado" });
+  // Guarda o token do dev p/ voltar depois.
+  res.cookie("nayara_dev", req.cookies[COOKIE], {
+    httpOnly: true, secure: process.env.NODE_ENV === "production", sameSite: "lax", maxAge: 60 * 60 * 1000,
+  });
+  // Sessão como o alvo, marcada com o dev (imp) e expirando em 1h.
+  res.cookie(COOKIE, await signTokenSeconds(id, 3600, req.user.id), {
+    httpOnly: true, secure: process.env.NODE_ENV === "production", sameSite: "lax", maxAge: 60 * 60 * 1000,
+  });
+  await logEvent("impersonate_start", { actor: "dev", targetUserId: id, detail: decField(t.rows[0].name) });
+  res.json({ success: true });
+});
+
+// Encerra a impersonação e volta para a conta dev.
+app.post("/api/dev/stop-impersonate", async (req, res) => {
+  const devToken = req.cookies["nayara_dev"];
+  if (!devToken) return res.status(400).json({ error: "Nada para restaurar" });
+  const payload = await verifyToken(devToken);
+  if (!payload) return res.status(400).json({ error: "Sessão dev expirada — faça login em /dev" });
+  const u = await query("SELECT is_dev FROM users WHERE id=$1", [Number(payload.sub)]);
+  if (!u.rows[0]?.is_dev) return res.status(403).json({ error: "Não autorizado" });
+  res.cookie(COOKIE, devToken, {
+    httpOnly: true, secure: process.env.NODE_ENV === "production", sameSite: "lax", maxAge: 30 * 24 * 60 * 60 * 1000,
+  });
+  res.clearCookie("nayara_dev");
   res.json({ success: true });
 });
 
