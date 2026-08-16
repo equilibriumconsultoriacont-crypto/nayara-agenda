@@ -3,6 +3,7 @@ import cookieParser from "cookie-parser";
 import bcrypt from "bcryptjs";
 import { SignJWT, jwtVerify } from "jose";
 import { randomBytes } from "crypto";
+import { encField, decField } from "./crypto.js";
 import pg from "pg";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
@@ -172,7 +173,7 @@ async function setupDB() {
   if (existing.rows.length === 0) {
     const hash = bcrypt.hashSync("26092000Nay.", 10);
     await query("INSERT INTO users (name, email, password_hash, role, is_owner) VALUES ($1,$2,$3,'owner',true)",
-      ["Nayara", "nayara.hummel@icloud.com", hash]);
+      [encField("Nayara"), "nayara.hummel@icloud.com", hash]);
     console.log("✅ Usuário Nayara criado!");
   }
   console.log("✅ Banco configurado!");
@@ -203,7 +204,18 @@ async function listAgendas(userId) {
        OR u.id IN (SELECT owner_id FROM agenda_access WHERE viewer_id = $1)
     ORDER BY is_mine DESC, u.name
   `, [userId]);
-  return r.rows.map((x) => ({ ownerId: x.owner_id, name: x.name, isMine: x.is_mine }));
+  return r.rows.map((x) => ({ ownerId: x.owner_id, name: decField(x.name), isMine: x.is_mine }));
+}
+
+// Decifra os campos exibidos das linhas do banco (no-op se estiverem em claro).
+function outShift(s) { if (s) s.notes = decField(s.notes); return s; }
+function outTagRow(t) {
+  if (t) {
+    t.tag_name = decField(t.tag_name);
+    t.notes = decField(t.notes);
+    t.assignee_name = decField(t.assignee_name);
+  }
+  return t;
 }
 
 // Destinatários das notificações da agenda de um dono: ele + quem tem acesso.
@@ -270,7 +282,7 @@ async function sendNotificationsForDate(dateStr) {
     `, [owner.id, dateStr]);
     const hasTags = tagsR.rows.length > 0;
     const tagsLine = hasTags
-      ? tagsR.rows.map(t => `${t.emoji} ${t.name}${t.start_time ? ` às ${t.start_time}` : ""}`).join(" · ")
+      ? tagsR.rows.map(t => `${t.emoji} ${decField(t.name)}${t.start_time ? ` às ${t.start_time}` : ""}`).join(" · ")
       : "";
 
     if (!shift && !hasTags) continue; // dia vazio → não incomoda
@@ -335,7 +347,7 @@ cron.schedule("* * * * *", async () => {
       WHERE st.date=$1 AND st.assigned_user_id IS NOT NULL AND st.start_time=$2
     `, [todayStr, `${hh}:${mm}`]);
     for (const r of tagRows.rows) {
-      await sendPushToUser(r.assigned_user_id, "⏰ Faltam 2 horas", `${r.emoji || "🏷️"} ${r.name} às ${r.start_time}`);
+      await sendPushToUser(r.assigned_user_id, "⏰ Faltam 2 horas", `${r.emoji || "🏷️"} ${decField(r.name)} às ${r.start_time}`);
     }
   } catch (e) { console.warn("[cron minuto]", e?.message); }
 }, { timezone: "America/Sao_Paulo" });
@@ -381,7 +393,7 @@ function setSessionCookie(res, token, remember) {
 
 async function publicUser(u) {
   return {
-    id: u.id, name: u.name, email: u.email, role: u.role,
+    id: u.id, name: decField(u.name), email: u.email, role: u.role,
     ownerId: u.owner_id ?? null, isOwner: !!u.is_owner,
     agendas: await listAgendas(u.id),
   };
@@ -422,7 +434,7 @@ app.get("/api/invite/:token", async (req, res) => {
   const inv = r.rows[0];
   if (!inv) return res.status(404).json({ error: "Convite inválido" });
   if (inv.used_by) return res.status(410).json({ error: "Este convite já foi usado" });
-  res.json({ name: inv.name, ownerName: inv.owner_name });
+  res.json({ name: decField(inv.name), ownerName: decField(inv.owner_name) });
 });
 
 // Cadastro via convite: cria a conta e já libera o acesso à agenda de quem convidou.
@@ -438,9 +450,10 @@ app.post("/api/register", async (req, res) => {
   const ex = await query("SELECT id FROM users WHERE email=$1", [emailN]);
   if (ex.rows.length > 0) return res.status(400).json({ error: "E-mail já cadastrado" });
   const hash = bcrypt.hashSync(password, 10);
+  const finalName = (name && name.trim()) ? name.trim() : decField(inv.name);
   const uR = await query(
     "INSERT INTO users (name,email,password_hash,role,is_owner) VALUES ($1,$2,$3,'viewer',false) RETURNING *",
-    [(name && name.trim()) || inv.name, emailN, hash]
+    [encField(finalName), emailN, hash]
   );
   const newUser = uR.rows[0];
   await query("INSERT INTO agenda_access (owner_id, viewer_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [inv.owner_id, newUser.id]);
@@ -462,7 +475,7 @@ app.post("/api/invites", requireAuth, async (req, res) => {
   const { name } = req.body;
   if (!name || !name.trim()) return res.status(400).json({ error: "Informe um nome" });
   const token = randomBytes(16).toString("hex");
-  await query("INSERT INTO invites (owner_id,name,token) VALUES ($1,$2,$3)", [req.user.id, name.trim(), token]);
+  await query("INSERT INTO invites (owner_id,name,token) VALUES ($1,$2,$3)", [req.user.id, encField(name.trim()), token]);
   res.json({ token });
 });
 app.get("/api/invites", requireAuth, async (req, res) => {
@@ -472,7 +485,7 @@ app.get("/api/invites", requireAuth, async (req, res) => {
      WHERE i.owner_id=$1 ORDER BY i.created_at DESC`,
     [req.user.id]
   );
-  res.json(r.rows.map(x => ({ id: x.id, name: x.name, token: x.token, used: !!x.used_by_name, usedByName: x.used_by_name })));
+  res.json(r.rows.map(x => ({ id: x.id, name: decField(x.name), token: x.token, used: !!x.used_by_name, usedByName: decField(x.used_by_name) })));
 });
 app.delete("/api/invites/:id", requireAuth, async (req, res) => {
   await query("DELETE FROM invites WHERE id=$1 AND owner_id=$2", [Number(req.params.id), req.user.id]);
@@ -484,10 +497,12 @@ app.get("/api/users", requireAuth, async (req, res) => {
   if (!req.user.is_owner) return res.json([]);
   const r = await query(
     `SELECT u.id, u.name, u.email FROM agenda_access a JOIN users u ON u.id = a.viewer_id
-     WHERE a.owner_id=$1 ORDER BY u.name`,
+     WHERE a.owner_id=$1`,
     [req.user.id]
   );
-  res.json(r.rows);
+  const list = r.rows.map(u => ({ id: u.id, name: decField(u.name), email: u.email }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  res.json(list);
 });
 // Remove o ACESSO de alguém (não apaga a conta da pessoa).
 app.delete("/api/users/:id", requireAuth, async (req, res) => {
@@ -498,7 +513,7 @@ app.delete("/api/users/:id", requireAuth, async (req, res) => {
 // ── Horários padrões (presets) ────────────────────────────────────────────────
 app.get("/api/presets", requireAuth, async (req, res) => {
   const r = await query("SELECT * FROM shift_presets WHERE owner_id=$1 ORDER BY start_time NULLS LAST, id", [req.user.id]);
-  res.json(r.rows);
+  res.json(r.rows.map(p => ({ ...p, label: decField(p.label) })));
 });
 app.post("/api/presets", requireAuth, async (req, res) => {
   if (!req.user.is_owner) return res.status(403).json({ error: "Ative sua agenda primeiro" });
@@ -506,7 +521,7 @@ app.post("/api/presets", requireAuth, async (req, res) => {
   if (!label || !label.trim()) return res.status(400).json({ error: "Informe um nome" });
   const r = await query(
     "INSERT INTO shift_presets (owner_id,label,type,start_time,end_time,hours,color) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *",
-    [req.user.id, label.trim(), type || "work", startTime || null, endTime || null, hours || null, color || null]
+    [req.user.id, encField(label.trim()), type || "work", startTime || null, endTime || null, hours || null, color || null]
   );
   // Aplica a cor deste horário padrão nos dias já lançados (sem cor) que batem com ele.
   if (color && startTime) {
@@ -516,7 +531,7 @@ app.post("/api/presets", requireAuth, async (req, res) => {
         AND (color IS NULL OR color='')
     `, [color, req.user.id, startTime, endTime || null]);
   }
-  res.json(r.rows[0]);
+  res.json({ ...r.rows[0], label: decField(r.rows[0].label) });
 });
 app.delete("/api/presets/:id", requireAuth, async (req, res) => {
   await query("DELETE FROM shift_presets WHERE id=$1 AND owner_id=$2", [Number(req.params.id), req.user.id]);
@@ -541,7 +556,7 @@ app.get("/api/shifts/:date/detail", requireAuth, async (req, res) => {
         ORDER BY st.start_time
       `, [ownerId, date]),
     ]);
-    res.json({ shift: shiftR.rows[0] || null, tags: tagsR.rows });
+    res.json({ shift: outShift(shiftR.rows[0] || null), tags: tagsR.rows.map(outTagRow) });
   } catch (e) {
     console.error("[detail]", e?.message);
     res.status(500).json({ error: "Erro ao carregar o dia" });
@@ -564,10 +579,11 @@ app.get("/api/shifts/:year/:month", requireAuth, async (req, res) => {
   ]);
   const tagsByDate = {};
   tagsR.rows.forEach(t => {
+    outTagRow(t);
     if (!tagsByDate[t.date]) tagsByDate[t.date] = [];
     tagsByDate[t.date].push(t);
   });
-  res.json({ shifts: shiftsR.rows, tagsByDate });
+  res.json({ shifts: shiftsR.rows.map(outShift), tagsByDate });
 });
 
 // Edição sempre na PRÓPRIA agenda (owner_id = usuário logado).
@@ -593,9 +609,9 @@ app.put("/api/shifts/:date", requireAuth, async (req, res) => {
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
     ON CONFLICT (owner_id,date) DO UPDATE SET
       type=$3,start_time=$4,end_time=$5,hours=$6,notes=$7,color=$8,updated_at=NOW()
-  `, [req.user.id, date, type, startTime || null, endTime || null, hours || null, notes || null, finalColor]);
+  `, [req.user.id, date, type, startTime || null, endTime || null, hours || null, encField(notes || null), finalColor]);
   const r = await query("SELECT * FROM shifts WHERE owner_id=$1 AND date=$2", [req.user.id, date]);
-  res.json(r.rows[0]);
+  res.json(outShift(r.rows[0]));
 });
 
 app.delete("/api/shifts/:date", requireAuth, async (req, res) => {
@@ -608,8 +624,9 @@ app.delete("/api/shifts/:date", requireAuth, async (req, res) => {
 app.get("/api/tags", requireAuth, async (req, res) => {
   const ownerId = Number(req.query.owner) || req.user.id;
   if (!(await canViewAgenda(req.user.id, ownerId))) return res.status(403).json({ error: "Sem acesso" });
-  const r = await query("SELECT * FROM tags WHERE owner_id=$1 ORDER BY name", [ownerId]);
-  res.json(r.rows);
+  const r = await query("SELECT * FROM tags WHERE owner_id=$1", [ownerId]);
+  const list = r.rows.map(t => ({ ...t, name: decField(t.name) })).sort((a, b) => a.name.localeCompare(b.name));
+  res.json(list);
 });
 app.post("/api/tags", requireAuth, async (req, res) => {
   if (!req.user.is_owner) return res.status(403).json({ error: "Sem permissão" });
@@ -617,9 +634,9 @@ app.post("/api/tags", requireAuth, async (req, res) => {
   if (!name) return res.status(400).json({ error: "Nome obrigatório" });
   const r = await query(
     "INSERT INTO tags (owner_id,name,color,emoji) VALUES ($1,$2,$3,$4) RETURNING *",
-    [req.user.id, name, color || "#6d28d9", emoji || "🏷️"]
+    [req.user.id, encField(name), color || "#6d28d9", emoji || "🏷️"]
   );
-  res.json(r.rows[0]);
+  res.json({ ...r.rows[0], name: decField(r.rows[0].name) });
 });
 app.delete("/api/tags/:id", requireAuth, async (req, res) => {
   if (!req.user.is_owner) return res.status(403).json({ error: "Sem permissão" });
@@ -652,14 +669,14 @@ app.put("/api/shift-tags/:date/:tagId", requireAuth, async (req, res) => {
     VALUES ($1,$2,$3,$4,$5,$6,$7)
     ON CONFLICT (owner_id,date,tag_id) DO UPDATE SET
       start_time=$4,end_time=$5,notes=$6,assigned_user_id=$7
-  `, [req.user.id, date, Number(tagId), startTime || null, endTime || null, notes || null, assigned?.id || null]);
+  `, [req.user.id, date, Number(tagId), startTime || null, endTime || null, encField(notes || null), assigned?.id || null]);
 
   if (assigned && prev.rows[0]?.assigned_user_id !== assigned.id) {
     const tagR = await query("SELECT name, emoji FROM tags WHERE id=$1", [Number(tagId)]);
     const t = tagR.rows[0] || {};
     const dLabel = new Date(date + "T12:00:00").toLocaleDateString("pt-BR", { weekday: "long", day: "2-digit", month: "2-digit" });
-    await sendPushToUser(assigned.id, `🏷️ ${req.user.name} marcou você`,
-      `${t.emoji || "🏷️"} ${t.name}${startTime ? ` às ${startTime}` : ""} — ${dLabel}`);
+    await sendPushToUser(assigned.id, `🏷️ ${decField(req.user.name)} marcou você`,
+      `${t.emoji || "🏷️"} ${decField(t.name)}${startTime ? ` às ${startTime}` : ""} — ${dLabel}`);
   }
   res.json({ success: true });
 });
