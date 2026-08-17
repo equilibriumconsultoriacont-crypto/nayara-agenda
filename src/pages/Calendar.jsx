@@ -141,16 +141,23 @@ export default function Calendar({ user, ownerId, canEdit, viewingName }) {
               <div key={idx} onClick={()=>handleDayClick(day)}
                 style={{
                   borderRadius:10,padding:'5px 2px',minHeight:70,minWidth:0,overflow:'hidden',boxSizing:'border-box',
-                  background:cfg?cfg.bg:isToday?'rgba(109,40,217,0.15)':'rgba(30,16,53,0.5)',
-                  border:`1px solid ${cfg?cfg.border:isToday?'rgba(109,40,217,0.5)':'rgba(109,40,217,0.1)'}`,
+                  background:cfg?cfg.bg:isToday?'rgba(167,139,250,0.22)':'rgba(30,16,53,0.5)',
+                  border:isToday?'2px solid #a78bfa':`1px solid ${cfg?cfg.border:'rgba(109,40,217,0.1)'}`,
                   cursor:'pointer',display:'flex',flexDirection:'column',alignItems:'center',gap:1,
-                  boxShadow:isToday?'0 0 12px rgba(109,40,217,0.3)':'none',
+                  boxShadow:isToday?'0 0 0 3px rgba(167,139,250,0.25), 0 0 16px rgba(167,139,250,0.5)':'none',
                   transition:'transform 0.1s',
+                  position:'relative',
                 }}
                 onTouchStart={e=>e.currentTarget.style.transform='scale(0.95)'}
                 onTouchEnd={e=>e.currentTarget.style.transform='scale(1)'}
               >
-                <span style={{fontSize:12,fontWeight:isToday?800:500,color:isToday?'#a78bfa':isSun||isSat?'#f87171':cfg?cfg.color:'#94a3b8'}}>{day}</span>
+                {isToday && (
+                  <span style={{
+                    position:'absolute',top:2,right:2,width:7,height:7,borderRadius:'50%',
+                    background:'#a78bfa',boxShadow:'0 0 6px #a78bfa',
+                  }}/>
+                )}
+                <span style={{fontSize:12,fontWeight:isToday?800:500,color:isToday?'#fff':isSun||isSat?'#f87171':cfg?cfg.color:'#94a3b8'}}>{day}</span>
                 {cfg&&<span style={{fontSize:15,lineHeight:1}}>{cfg.emoji}</span>}
                 {shift&&shift.type!=='off'&&shift.start_time&&(
                   <span style={{fontSize:9,color:cfg?.color,fontWeight:700,lineHeight:1.15,textAlign:'center'}}>
